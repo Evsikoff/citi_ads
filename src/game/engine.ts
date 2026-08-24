@@ -22,7 +22,8 @@ export interface GameCallbacks {
   onWin(stats: { time: number; top: number }): void;
   onGameOver(stats: { time: number; found: number }): void;
   onBumpKnown(): void;
-  onStationUnlock(active: number, total: number): void;
+  onStationUnlock(active: number, total: number, origin: "timer" | "ad"): void;
+  onStationLock(active: number, total: number): void;
 }
 
 type ParticleKind = "smoke" | "spark" | "confetti" | "leaf";
@@ -55,6 +56,10 @@ const REV_MAX = 215;
 const CAR_R = 15;
 const KMH = 0.28;
 const MM = 216;
+const REFUEL_RATE = 10; // л/с на работающей АЗС
+const UNLOCK_DELAY_S = 1; // через сколько секунд после заправки откроется следующая АЗС (будет формулой)
+const MIN_SESSION_L = 3; // меньше стольких литров «заправкой» не считается (проезд мимо)
+const M_PER_PX = 0.35; // метров в мировом пикселе — для дистанций на миникарте
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
@@ -114,6 +119,10 @@ export class CityRideGame {
   private refuelSndCd = 0;
   private warnCd = 0;
   private stationsActive = 0;
+  private refuelStation: Station | null = null; // где сейчас идёт заправка
+  private sessionGain = 0; // сколько литров получили в текущей сессии
+  private pendingUnlock = false; // ждём открытия следующей АЗС
+  private unlockTimer = 0; // сколько секунд до открытия
 
   private particles: Particle[] = [];
   private skids: Skid[] = [];
@@ -236,7 +245,10 @@ export class CityRideGame {
         best = s;
       }
     }
-    if (best) best.state = "active";
+    if (best) {
+      best.state = "active";
+      best.origin = "start";
+    }
     this.stationsActive = best ? 1 : 0;
   }
 
@@ -460,23 +472,35 @@ export class CityRideGame {
         this.cb.onGameOver({ time: this.time, found: this.found });
       }
     }
-    // заправка: только на работающих АЗС, 10 л/с
-    let atStation = false;
+    // отложенное открытие следующей АЗС (после заправки на «обычной» станции)
+    if (this.pendingUnlock) {
+      this.unlockTimer -= dt;
+      if (this.unlockTimer <= 0) {
+        this.pendingUnlock = false;
+        this.unlockRandom("timer");
+      }
+    }
+    // заправка: только на работающих АЗС, REFUEL_RATE л/с
+    let at: Station | null = null;
     if (!this.stalled) {
       for (const s of this.city.stations) {
         if (s.state !== "active") continue;
         if (c.x > s.x - 6 && c.x < s.x + s.w + 6 && c.y > s.y - 6 && c.y < s.y + s.h + 6) {
-          atStation = true;
+          at = s;
           break;
         }
       }
     }
-    const wasRefueling = this.refueling;
-    if (atStation && this.fuel < this.fuelMax) {
+    if (at && this.fuel < this.fuelMax) {
+      if (this.refuelStation !== at) {
+        this.endRefuelSession(); // переехали на другую колонку — закрываем прежнюю сессию
+        this.refuelStation = at;
+        this.sessionGain = 0;
+      }
       const was = this.fuel;
-      this.fuel = Math.min(this.fuelMax, this.fuel + 10 * dt);
+      this.fuel = Math.min(this.fuelMax, this.fuel + REFUEL_RATE * dt);
+      this.sessionGain += this.fuel - was;
       this.refueling = true;
-      if (!wasRefueling) this.unlockNextStation(); // начали заправку — открылась следующая АЗС
       this.refuelSndCd -= dt;
       if (this.refuelSndCd <= 0) {
         sfx.blip();
@@ -493,6 +517,7 @@ export class CityRideGame {
       }
     } else {
       this.refueling = false;
+      if (this.refuelStation) this.endRefuelSession(); // сессия закончилась — станция закрывается
     }
     // предупреждение о низком баке
     if (!this.stalled && this.fuel < this.fuelMax * 0.22 && this.fuel > 0) {
@@ -504,28 +529,45 @@ export class CityRideGame {
     }
   }
 
-  /** разблокировать следующую АЗС — ближайшую к машине из «пустых» */
-  private unlockNextStation(): void {
-    let best: Station | null = null;
-    let bd = Infinity;
-    for (const s of this.city.stations) {
-      if (s.state !== "locked") continue;
-      const d = Math.hypot(s.x + s.w / 2 - this.car.x, s.y + s.h / 2 - this.car.y);
-      if (d < bd) {
-        bd = d;
-        best = s;
-      }
+  /** конец сессии заправки: станция, отдавшая топливо, блокируется */
+  private endRefuelSession(): void {
+    const s = this.refuelStation;
+    this.refuelStation = null;
+    const gained = this.sessionGain;
+    this.sessionGain = 0;
+    if (!s || gained < MIN_SESSION_L) return; // короткий проезд мимо — не считается
+    if (s.state !== "active") return;
+    s.state = "locked";
+    this.stationsActive = Math.max(0, this.stationsActive - 1);
+    const cx = s.x + s.w / 2;
+    const cy = s.y + s.h / 2 - 20;
+    for (let i = 0; i < 12; i++) {
+      this.spawn(cx, cy, "smoke", "rgba(112,118,130,0.55)", 1.15, 55);
     }
-    if (!best) return;
-    best.state = "active";
+    sfx.stationLock();
+    this.cb.onStationLock(this.stationsActive, this.city.stations.length);
+    // станции, открытые за рекламу, не запускают цепочку — новая АЗС не открывается
+    if (s.origin !== "ad" && this.city.stations.some((x) => x.state === "locked")) {
+      this.pendingUnlock = true;
+      this.unlockTimer = UNLOCK_DELAY_S;
+    }
+  }
+
+  /** открыть случайную АЗС из закрытых (по таймеру или за просмотр рекламы) */
+  private unlockRandom(origin: "timer" | "ad"): void {
+    const locked = this.city.stations.filter((x) => x.state === "locked");
+    if (!locked.length) return;
+    const st = locked[Math.floor(Math.random() * locked.length)];
+    st.state = "active";
+    st.origin = origin;
     this.stationsActive += 1;
-    const cx = best.x + best.w / 2;
-    const cy = best.y + best.h / 2;
+    const cx = st.x + st.w / 2;
+    const cy = st.y + st.h / 2;
     for (let i = 0; i < 18; i++) {
       this.spawn(cx, cy, "spark", i % 2 ? "#ffd27a" : "#7ee08a", 0.8, 260);
     }
     sfx.unlock();
-    this.cb.onStationUnlock(this.stationsActive, this.city.stations.length);
+    this.cb.onStationUnlock(this.stationsActive, this.city.stations.length, origin);
   }
 
   private pushSkid(a: { x: number; y: number }, b: { x: number; y: number }): void {
@@ -644,6 +686,7 @@ export class CityRideGame {
       this.spawn(cx, cy, "confetti", colors[i % colors.length], 0.95, 330);
     }
     sfx.chime();
+    this.unlockRandom("ad"); // просмотр рекламы активирует ещё одну АЗС
     this.cb.onDiscover(b.client, this.found);
     if (this.found >= this.total && !this.won) {
       this.won = true;
@@ -1394,11 +1437,15 @@ export class CityRideGame {
     m.clearRect(0, 0, MM, MM);
     m.drawImage(this.mmBase, 0, 0);
     // АЗС: активные — пульсирующий оранжевый, «пустые» — серые с красной точкой
+    const carMX = this.car.x * s;
+    const carMY = this.car.y * s;
     for (const st of this.city.stations) {
       const sx = st.x * s - 1;
       const sy = st.y * s - 1;
       const sw = st.w * s + 2;
       const sh = st.h * s + 2;
+      const mx = sx + sw / 2;
+      const my = sy + sh / 2;
       if (st.state === "active") {
         const pulse = 0.55 + 0.45 * Math.sin(this.wall * 3 + st.x * 0.01);
         m.fillStyle = "#f2a93b";
@@ -1406,6 +1453,50 @@ export class CityRideGame {
         m.strokeStyle = `rgba(255,224,160,${pulse * 0.9})`;
         m.lineWidth = 1;
         m.strokeRect(sx - 2, sy - 2, sw + 4, sh + 4);
+        // стрелка от машины к станции + дистанция
+        const dx = mx - carMX;
+        const dy = my - carMY;
+        const dpx = Math.hypot(dx, dy);
+        if (dpx > 22) {
+          const ux = dx / dpx;
+          const uy = dy / dpx;
+          const x1 = carMX + ux * 9;
+          const y1 = carMY + uy * 9;
+          const x2 = mx - ux * 9;
+          const y2 = my - uy * 9;
+          m.strokeStyle = "rgba(242,169,59,0.85)";
+          m.lineWidth = 1.6;
+          m.beginPath();
+          m.moveTo(x1, y1);
+          m.lineTo(x2, y2);
+          m.stroke();
+          const ang = Math.atan2(y2 - y1, x2 - x1);
+          m.fillStyle = "rgba(255,209,122,0.95)";
+          m.beginPath();
+          m.moveTo(x2 + Math.cos(ang) * 4.6, y2 + Math.sin(ang) * 4.6);
+          m.lineTo(x2 + Math.cos(ang + 2.5) * 4.4, y2 + Math.sin(ang + 2.5) * 4.4);
+          m.lineTo(x2 + Math.cos(ang - 2.5) * 4.4, y2 + Math.sin(ang - 2.5) * 4.4);
+          m.closePath();
+          m.fill();
+          // подпись с дистанцией
+          const meters = (dpx / s) * M_PER_PX;
+          const label =
+            meters >= 1000
+              ? `${(meters / 1000).toFixed(1).replace(".", ",")} км`
+              : `${Math.round(meters / 10) * 10} м`;
+          const lx = (x1 + x2) / 2;
+          const ly = (y1 + y2) / 2;
+          m.font = "700 9px Rubik";
+          m.textAlign = "center";
+          m.textBaseline = "middle";
+          const tw = m.measureText(label).width;
+          m.fillStyle = "rgba(8,12,22,0.85)";
+          m.fillRect(lx - tw / 2 - 3, ly - 6.5, tw + 6, 13);
+          m.fillStyle = "#ffd9a0";
+          m.fillText(label, lx, ly + 0.5);
+          m.textAlign = "left";
+          m.textBaseline = "alphabetic";
+        }
       } else {
         m.fillStyle = "#333b49";
         m.fillRect(sx, sy, sw, sh);
