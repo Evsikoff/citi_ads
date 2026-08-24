@@ -46,10 +46,13 @@ export interface Park extends Rect {
 }
 
 /** АЗС: площадка в углу квартала, въезды с двух прилегающих дорог */
+export type StationState = "locked" | "active";
+
 export interface Station extends Rect {
   corner: 0 | 1 | 2 | 3; // 0 — верхний левый, 1 — верхний правый, 2 — нижний левый, 3 — нижний правый
   bx: number; // начало квартала по x
   by: number; // начало квартала по y
+  state: StationState; // «нет топлива» или работает
 }
 
 export interface City {
@@ -203,7 +206,7 @@ export function buildCity(clients: Client[]): City {
     const y = s.c === 2 || s.c === 3 ? b.y + BLOCK - STATION_PAD - STATION_MARGIN : b.y + STATION_MARGIN;
     const pad: Rect = { x, y, w: STATION_PAD, h: STATION_PAD };
     if (stations.some((st) => hit(grow(st, 400), pad))) continue;
-    stations.push({ ...pad, corner: s.c, bx: b.x, by: b.y });
+    stations.push({ ...pad, corner: s.c, bx: b.x, by: b.y, state: "locked" });
   }
 
   /* здания и деревья не должны стоять на площадке АЗС */

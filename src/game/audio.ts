@@ -79,6 +79,11 @@ class Sfx {
     this.engGain.gain.setTargetAtTime(0.012, t, 0.2);
   }
 
+  /** разблокировка новой заправки */
+  unlock(): void {
+    this.tone([392, 587, 880], 0.08, "square", 0.085, 0.03);
+  }
+
   /** радостный перезвон при подписании клиента */
   chime(): void {
     this.tone([523, 659, 784, 1046], 0.09, "triangle", 0.16, 0.05);

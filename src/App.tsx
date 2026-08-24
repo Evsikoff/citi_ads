@@ -72,6 +72,7 @@ export default function App() {
   const fuelIconRef = useRef<HTMLSpanElement>(null);
   const refuelRef = useRef<HTMLSpanElement>(null);
   const lowRef = useRef<HTMLSpanElement>(null);
+  const stationsCountRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
 
   const [phase, setPhase] = useState<"menu" | "play">("menu");
@@ -106,15 +107,22 @@ export default function App() {
         if (needleRef.current) needleRef.current.style.transform = `rotate(${pct * 270}deg)`;
         if (arcRef.current) arcRef.current.style.strokeDashoffset = String(100 - pct * 100);
         const f = h.fuel;
+        const fm = h.fuelMax || 50;
+        const fr = f / fm;
         if (fuelFillRef.current) {
-          const fp = Math.max(0, Math.min(1, f / 100));
+          const fp = Math.max(0, Math.min(1, fr));
           fuelFillRef.current.style.width = `${fp * 100}%`;
-          fuelFillRef.current.style.background = f < 22 ? "#ff6b5a" : f < 50 ? "#ffb454" : "#7ee08a";
+          fuelFillRef.current.style.background = fr < 0.22 ? "#ff6b5a" : fr < 0.5 ? "#ffb454" : "#7ee08a";
         }
         if (fuelTextRef.current) fuelTextRef.current.textContent = `${Math.round(f)} л`;
-        if (fuelIconRef.current) fuelIconRef.current.style.color = f < 22 ? "#ff6b5a" : "#7ee08a";
+        if (fuelIconRef.current) fuelIconRef.current.style.color = fr < 0.22 ? "#ff6b5a" : "#7ee08a";
         if (refuelRef.current) refuelRef.current.style.opacity = h.refueling ? "1" : "0";
-        if (lowRef.current) lowRef.current.style.display = !h.refueling && f < 22 && f > 0 ? "inline" : "none";
+        if (lowRef.current) lowRef.current.style.display = !h.refueling && fr < 0.22 && f > 0 ? "inline" : "none";
+        if (stationsCountRef.current) {
+          const full = h.stationsActive >= h.stationsTotal;
+          stationsCountRef.current.textContent = `${h.stationsActive}/${h.stationsTotal}`;
+          stationsCountRef.current.style.color = full ? "#7ee08a" : "#f2a93b";
+        }
       },
       onDiscover: (client, index) => {
         setFoundIds((prev) => (prev.includes(client.id) ? prev : [...prev, client.id]));
@@ -123,6 +131,8 @@ export default function App() {
       onWin: (stats) => setWin(stats),
       onGameOver: (stats) => setGameover(stats),
       onBumpKnown: () => showToast("Этот клиент уже подписан — ищи свободный щит"),
+      onStationUnlock: (active, total) =>
+        showToast(`Новая АЗС в сети! Теперь заправиться можно в ${active} из ${total} точек`),
     });
     gameRef.current = game;
     return () => {
@@ -267,7 +277,7 @@ export default function App() {
                   <div className="flex justify-between items-baseline">
                     <span className="text-[9px] uppercase tracking-[0.2em] text-slate-500 font-semibold">Топливо</span>
                     <span ref={fuelTextRef} className="font-display text-[11px] text-slate-300 tabular-nums leading-none">
-                      100 л
+                      50 л
                     </span>
                   </div>
                   <div className="h-2.5 mt-1 bg-night-950/80 border border-night-600 rounded-sm overflow-hidden">
@@ -334,6 +344,17 @@ export default function App() {
           {/* правый низ: миникарта */}
           <div className="absolute bottom-4 right-4 z-10 pointer-events-none flex flex-col items-end gap-1.5">
             <div className="bg-night-900/85 border border-night-600 rounded-lg p-2 shadow-[0_10px_30px_rgba(0,0,0,0.4)]">
+              <div className="flex items-center justify-between px-0.5 pb-1.5">
+                <span className="flex items-center gap-1.5 text-[9px] uppercase tracking-[0.18em] text-slate-500 font-bold">
+                  <span className="text-[#f2a93b]">
+                    <FuelIcon className="w-3.5 h-3.5" />
+                  </span>
+                  АЗС в сети
+                </span>
+                <span ref={stationsCountRef} className="font-display text-xs text-amber-glow tabular-nums leading-none">
+                  1/5
+                </span>
+              </div>
               <canvas ref={minimapRef} width={216} height={216} className="w-[164px] h-[164px] rounded-md" />
             </div>
             <div className="flex items-center gap-3 text-[10px] text-slate-500">
@@ -344,7 +365,10 @@ export default function App() {
                 <span className="w-2 h-2 rounded-sm bg-slate-500 inline-block" /> подписан
               </span>
               <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-[2px] bg-[#f2a93b] inline-block" /> АЗС
+                <span className="w-2 h-2 rounded-[2px] bg-[#f2a93b] inline-block anim-pulse-soft" /> АЗС работает
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2 h-2 rounded-[2px] bg-[#333b49] border border-[#a34a3e] inline-block" /> нет топлива
               </span>
             </div>
           </div>
@@ -440,9 +464,9 @@ export default function App() {
                 <p className="mt-5 text-slate-300 leading-relaxed max-w-md">
                   Твои клиенты ждут рекламу. Гоняй по ночному району, находи свободные
                   билборды — они подсвечены янтарным — и врезайся в них, чтобы подписать
-                  контракт. Каждый щит открывает лендинг клиента. Следи за баком: бензин
-                  тратится на ходу, а заправляться нужно на АЗС — оранжевые навесы видны
-                  на миникарте. Кончится топливо — смена сорвётся.
+                  контракт. Каждый щит открывает лендинг клиента. В баке всего 50 литров,
+                  а работает лишь одна АЗС: начал заправляться — и следующая станция
+                  выходит в сеть. Кончится топливо — смена сорвётся.
                 </p>
                 <div className="mt-7 flex items-center gap-5 flex-wrap">
                   <button
@@ -485,7 +509,8 @@ export default function App() {
                   <span className="mt-0.5 text-[#f2a93b] shrink-0">
                     <FuelIcon className="w-4 h-4" />
                   </span>
-                  Бак тает на ходу и на ручнике. Заехал на площадку АЗС — бензин льётся сам. Пустой бак — начинаешь заново.
+                  Стартовый бак — 50 л. Работающая АЗС льёт 10 л/с, «серые» станции без топлива.
+                  Каждая заправка открывает следующую АЗС — следи за счётчиком у миникарты. Пустой бак — начинаешь заново.
                 </div>
               </div>
             </div>
