@@ -347,22 +347,8 @@ export default function App() {
             </div>
           </div>
 
-          {/* правый низ: миникарта */}
+          {/* правый низ: легенда обозначений */}
           <div className="absolute bottom-4 right-4 z-10 pointer-events-none flex flex-col items-end gap-1.5">
-            <div className="bg-night-900/85 border border-night-600 rounded-lg p-2 shadow-[0_10px_30px_rgba(0,0,0,0.4)]">
-              <div className="flex items-center justify-between px-0.5 pb-1.5">
-                <span className="flex items-center gap-1.5 text-[9px] uppercase tracking-[0.18em] text-slate-500 font-bold">
-                  <span className="text-[#f2a93b]">
-                    <FuelIcon className="w-3.5 h-3.5" />
-                  </span>
-                  АЗС в сети
-                </span>
-                <span ref={stationsCountRef} className="font-display text-xs text-amber-glow tabular-nums leading-none">
-                  1/5
-                </span>
-              </div>
-              <canvas ref={minimapRef} width={216} height={216} className="w-[164px] h-[164px] rounded-md" />
-            </div>
             <div className="flex items-center gap-3 text-[10px] text-slate-500">
               <span className="flex items-center gap-1">
                 <span className="w-2 h-2 rounded-full bg-amber-glow inline-block anim-pulse-soft" /> свободный щит
