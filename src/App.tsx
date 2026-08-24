@@ -131,8 +131,14 @@ export default function App() {
       onWin: (stats) => setWin(stats),
       onGameOver: (stats) => setGameover(stats),
       onBumpKnown: () => showToast("Этот клиент уже подписан — ищи свободный щит"),
-      onStationUnlock: (active, total) =>
-        showToast(`Новая АЗС в сети! Теперь заправиться можно в ${active} из ${total} точек`),
+      onStationUnlock: (active, total, origin) =>
+        showToast(
+          origin === "ad"
+            ? `Реклама сработала: открылась ещё одна АЗС — теперь ${active} из ${total}`
+            : `Подвезли топливо: новая АЗС в сети — ${active} из ${total}`
+        ),
+      onStationLock: (active, total) =>
+        showToast(`АЗС израсходована и закрыта. Активных станций: ${active} из ${total}`),
     });
     gameRef.current = game;
     return () => {
@@ -370,6 +376,12 @@ export default function App() {
               <span className="flex items-center gap-1">
                 <span className="w-2 h-2 rounded-[2px] bg-[#333b49] border border-[#a34a3e] inline-block" /> нет топлива
               </span>
+              <span className="flex items-center gap-1">
+                <svg viewBox="0 0 24 24" fill="none" className="w-3 h-3 text-[#f2a93b]">
+                  <path d="M4 12h13M13 7l5 5-5 5" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                стрелка — путь и метры до АЗС
+              </span>
             </div>
           </div>
 
@@ -464,9 +476,10 @@ export default function App() {
                 <p className="mt-5 text-slate-300 leading-relaxed max-w-md">
                   Твои клиенты ждут рекламу. Гоняй по ночному району, находи свободные
                   билборды — они подсвечены янтарным — и врезайся в них, чтобы подписать
-                  контракт. Каждый щит открывает лендинг клиента. В баке всего 50 литров,
-                  а работает лишь одна АЗС: начал заправляться — и следующая станция
-                  выходит в сеть. Кончится топливо — смена сорвётся.
+                  контракт. Каждый щит открывает лендинг клиента — и активирует
+                  дополнительную заправку. В баке всего 50 литров, а после каждой заправки
+                  станция закрывается: следующая выйдет в сеть через секунду. Кончится
+                  топливо — смена сорвётся.
                 </p>
                 <div className="mt-7 flex items-center gap-5 flex-wrap">
                   <button
@@ -509,8 +522,10 @@ export default function App() {
                   <span className="mt-0.5 text-[#f2a93b] shrink-0">
                     <FuelIcon className="w-4 h-4" />
                   </span>
-                  Стартовый бак — 50 л. Работающая АЗС льёт 10 л/с, «серые» станции без топлива.
-                  Каждая заправка открывает следующую АЗС — следи за счётчиком у миникарты. Пустой бак — начинаешь заново.
+                  Стартовый бак — 50 л, работающая АЗС льёт 10 л/с. После заправки станция
+                  закрывается, а через секунду открывается следующая. Просмотр рекламы на
+                  билборде активирует дополнительную АЗС — но заправка на ней новых станций не открывает.
+                  Пустой бак — начинаешь заново.
                 </div>
               </div>
             </div>
