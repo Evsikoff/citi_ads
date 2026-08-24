@@ -31,6 +31,17 @@ const SpeakerIcon = ({ muted }: { muted: boolean }) => (
     )}
   </svg>
 );
+const FuelIcon = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className ?? "w-5 h-5"}>
+    <path
+      d="M5 21V6a2 2 0 012-2h5a2 2 0 012 2v15M4 21h11M14 10h2a2 2 0 012 2v5a1.5 1.5 0 003 0v-7.5L18.5 7M7 8h5v4H7z"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
 const TrophyIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" className="w-10 h-10 text-amber-glow">
     <path
@@ -56,6 +67,11 @@ export default function App() {
   const needleRef = useRef<SVGGElement>(null);
   const arcRef = useRef<SVGPathElement>(null);
   const timerRef = useRef<HTMLSpanElement>(null);
+  const fuelFillRef = useRef<HTMLDivElement>(null);
+  const fuelTextRef = useRef<HTMLSpanElement>(null);
+  const fuelIconRef = useRef<HTMLSpanElement>(null);
+  const refuelRef = useRef<HTMLSpanElement>(null);
+  const lowRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
 
   const [phase, setPhase] = useState<"menu" | "play">("menu");
@@ -63,6 +79,7 @@ export default function App() {
   const [foundIds, setFoundIds] = useState<string[]>([]);
   const [muted, setMuted] = useState(false);
   const [win, setWin] = useState<{ time: number; top: number } | null>(null);
+  const [gameover, setGameover] = useState<{ time: number; found: number } | null>(null);
   const [toast, setToast] = useState<{ id: number; msg: string } | null>(null);
   const [touch] = useState(
     () => typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches
@@ -88,12 +105,23 @@ export default function App() {
         const pct = Math.min(h.speed / 180, 1);
         if (needleRef.current) needleRef.current.style.transform = `rotate(${pct * 270}deg)`;
         if (arcRef.current) arcRef.current.style.strokeDashoffset = String(100 - pct * 100);
+        const f = h.fuel;
+        if (fuelFillRef.current) {
+          const fp = Math.max(0, Math.min(1, f / 100));
+          fuelFillRef.current.style.width = `${fp * 100}%`;
+          fuelFillRef.current.style.background = f < 22 ? "#ff6b5a" : f < 50 ? "#ffb454" : "#7ee08a";
+        }
+        if (fuelTextRef.current) fuelTextRef.current.textContent = `${Math.round(f)} л`;
+        if (fuelIconRef.current) fuelIconRef.current.style.color = f < 22 ? "#ff6b5a" : "#7ee08a";
+        if (refuelRef.current) refuelRef.current.style.opacity = h.refueling ? "1" : "0";
+        if (lowRef.current) lowRef.current.style.display = !h.refueling && f < 22 && f > 0 ? "inline" : "none";
       },
       onDiscover: (client, index) => {
         setFoundIds((prev) => (prev.includes(client.id) ? prev : [...prev, client.id]));
         setModal({ client, index });
       },
       onWin: (stats) => setWin(stats),
+      onGameOver: (stats) => setGameover(stats),
       onBumpKnown: () => showToast("Этот клиент уже подписан — ищи свободный щит"),
     });
     gameRef.current = game;
@@ -121,7 +149,8 @@ export default function App() {
     setFoundIds([]);
     setWin(null);
     setModal(null);
-    showToast("Новая смена: все билборды снова свободны");
+    setGameover(null);
+    showToast("Новая смена: все билборды снова свободны, бак полный");
   };
 
   const toggleMute = () => {
@@ -133,9 +162,14 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.code === "Enter" && phase === "menu") {
-        e.preventDefault();
-        start();
+      if (e.code === "Enter") {
+        if (phase === "menu") {
+          e.preventDefault();
+          start();
+        } else if (gameover) {
+          e.preventDefault();
+          restart();
+        }
       }
       if (e.code === "KeyM") toggleMute();
       if (e.code === "Escape") {
@@ -146,7 +180,7 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, modal, win]);
+  }, [phase, modal, win, gameover]);
 
   const hold = (k: "up" | "down" | "left" | "right") => ({
     onPointerDown: (e: ReactPointerEvent) => {
@@ -221,9 +255,33 @@ export default function App() {
             </div>
           </div>
 
-          {/* левый низ: спидометр */}
+          {/* левый низ: топливо и спидометр */}
           <div className="absolute bottom-4 left-4 z-10 pointer-events-none">
-            <div className="bg-night-900/85 border border-night-600 rounded-lg p-3 flex items-center gap-3 shadow-[0_10px_30px_rgba(0,0,0,0.4)]">
+            <div className="bg-night-900/85 border border-night-600 rounded-lg p-3 flex flex-col gap-2.5 shadow-[0_10px_30px_rgba(0,0,0,0.4)]">
+              {/* шкала топлива */}
+              <div className="w-[228px] flex items-center gap-2.5 pb-2 border-b border-night-700">
+                <span ref={fuelIconRef} className="shrink-0" style={{ color: "#7ee08a" }}>
+                  <FuelIcon />
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="flex justify-between items-baseline">
+                    <span className="text-[9px] uppercase tracking-[0.2em] text-slate-500 font-semibold">Топливо</span>
+                    <span ref={fuelTextRef} className="font-display text-[11px] text-slate-300 tabular-nums leading-none">
+                      100 л
+                    </span>
+                  </div>
+                  <div className="h-2.5 mt-1 bg-night-950/80 border border-night-600 rounded-sm overflow-hidden">
+                    <div ref={fuelFillRef} className="h-full rounded-[1px]" style={{ width: "100%", background: "#7ee08a" }} />
+                  </div>
+                </div>
+                <span ref={refuelRef} className="font-display text-[10px] text-[#7ee08a] anim-blink shrink-0" style={{ opacity: 0 }}>
+                  ЗАПРАВКА
+                </span>
+                <span ref={lowRef} className="font-display text-[10px] text-[#ff6b5a] anim-blink shrink-0" style={{ display: "none" }}>
+                  НА АЗС!
+                </span>
+              </div>
+              <div className="flex items-center gap-3">
               <svg viewBox="0 0 120 120" className="w-[116px] h-[116px]">
                 <defs>
                   <linearGradient id="speedGrad" x1="0" y1="1" x2="1" y2="0">
@@ -269,6 +327,7 @@ export default function App() {
                   ночная смена
                 </div>
               </div>
+              </div>
             </div>
           </div>
 
@@ -283,6 +342,9 @@ export default function App() {
               </span>
               <span className="flex items-center gap-1">
                 <span className="w-2 h-2 rounded-sm bg-slate-500 inline-block" /> подписан
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2 h-2 rounded-[2px] bg-[#f2a93b] inline-block" /> АЗС
               </span>
             </div>
           </div>
@@ -378,7 +440,9 @@ export default function App() {
                 <p className="mt-5 text-slate-300 leading-relaxed max-w-md">
                   Твои клиенты ждут рекламу. Гоняй по ночному району, находи свободные
                   билборды — они подсвечены янтарным — и врезайся в них, чтобы подписать
-                  контракт. Каждый щит открывает лендинг клиента.
+                  контракт. Каждый щит открывает лендинг клиента. Следи за баком: бензин
+                  тратится на ходу, а заправляться нужно на АЗС — оранжевые навесы видны
+                  на миникарте. Кончится топливо — смена сорвётся.
                 </p>
                 <div className="mt-7 flex items-center gap-5 flex-wrap">
                   <button
@@ -416,6 +480,12 @@ export default function App() {
                 <div className="mt-5 pt-4 border-t border-night-700 flex items-start gap-2.5 text-xs text-slate-400 leading-relaxed">
                   <span className="mt-1 w-2 h-2 rounded-full bg-amber-glow shrink-0 anim-pulse-soft" />
                   Свободные щиты мигают на карте и в городе. Здания — прочные, газон — медленный.
+                </div>
+                <div className="mt-3 pt-3 border-t border-night-700 flex items-start gap-2.5 text-xs text-slate-400 leading-relaxed">
+                  <span className="mt-0.5 text-[#f2a93b] shrink-0">
+                    <FuelIcon className="w-4 h-4" />
+                  </span>
+                  Бак тает на ходу и на ручнике. Заехал на площадку АЗС — бензин льётся сам. Пустой бак — начинаешь заново.
                 </div>
               </div>
             </div>
@@ -462,6 +532,47 @@ export default function App() {
               >
                 Кататься дальше
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= кончилось топливо ================= */}
+      {gameover && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-[rgba(5,8,16,0.74)] anim-fade" />
+          <div className="relative bg-night-800 border border-[#5a2c24] rounded-xl p-8 max-w-md w-full text-center anim-pop shadow-[0_30px_90px_rgba(0,0,0,0.65)]">
+            <div className="flex justify-center text-[#ff6b5a]">
+              <FuelIcon className="w-10 h-10" />
+            </div>
+            <h2 className="font-display text-3xl md:text-4xl text-[#f2ecdf] mt-4 leading-tight">
+              Бензин <span className="text-[#ff6b5a]">кончился!</span>
+            </h2>
+            <p className="mt-3 text-slate-400 leading-relaxed">
+              Машина заглохла посреди города. В следующий раз закладывай маршрут до АЗС —
+              оранжевые площадки «ОКТАН» отмечены на миникарте.
+            </p>
+            <div className="mt-6 grid grid-cols-2 gap-3">
+              <div className="bg-night-900/80 border border-night-700 rounded-lg py-4">
+                <div className="font-display text-2xl text-amber-glow tabular-nums">
+                  {gameover.found}
+                  <span className="text-sm text-slate-500">/{CLIENTS.length}</span>
+                </div>
+                <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mt-1">клиентов подписано</div>
+              </div>
+              <div className="bg-night-900/80 border border-night-700 rounded-lg py-4">
+                <div className="font-display text-2xl text-aqua-glow tabular-nums">{fmt(gameover.time)}</div>
+                <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mt-1">время в пути</div>
+              </div>
+            </div>
+            <button
+              onClick={restart}
+              className="mt-7 w-full rounded-md bg-[#ff6b5a] text-night-950 font-display text-sm tracking-wide px-6 py-4 hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 shadow-[0_8px_24px_rgba(255,107,90,0.35)]"
+            >
+              Начать заново
+            </button>
+            <div className="mt-3 text-xs text-slate-500">
+              или нажми <span className="kbd">ENTER</span>
             </div>
           </div>
         </div>

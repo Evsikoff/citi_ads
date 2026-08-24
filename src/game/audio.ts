@@ -117,6 +117,42 @@ class Sfx {
     this.tone([1180], 0.05, "square", 0.045, 0);
   }
 
+  /** предупреждение: мало топлива */
+  warn(): void {
+    this.tone([880, 640], 0.15, "square", 0.06, 0);
+  }
+
+  /** капля бензина при заправке */
+  blip(): void {
+    this.tone([1500 + Math.random() * 260], 0.05, "sine", 0.05, 0);
+  }
+
+  /** бак полон */
+  tankFull(): void {
+    this.tone([660, 880, 1320], 0.08, "triangle", 0.13, 0.03);
+  }
+
+  /** мотор заглох */
+  stall(): void {
+    if (!this.ac || !this.master) return;
+    try {
+      const t = this.ac.currentTime;
+      const osc = this.ac.createOscillator();
+      osc.type = "sawtooth";
+      osc.frequency.setValueAtTime(130, t);
+      osc.frequency.exponentialRampToValueAtTime(26, t + 0.7);
+      const g = this.ac.createGain();
+      g.gain.setValueAtTime(0.17, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.78);
+      osc.connect(g);
+      g.connect(this.master);
+      osc.start(t);
+      osc.stop(t + 0.85);
+    } catch {
+      /* тишина */
+    }
+  }
+
   private tone(freqs: number[], step: number, type: OscillatorType, vol: number, offset: number): void {
     if (!this.ac || !this.master) return;
     try {
