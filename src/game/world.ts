@@ -7,6 +7,8 @@ export const GRID = 5; // 5×5 кварталов
 export const WORLD = GRID * BLOCK + (GRID + 1) * ROAD; // 5320
 export const SIDEWALK = 26; // тротуар по краю квартала
 const BUILD_INSET = 96; // здания не ближе этой границы (место под билборды)
+const STATION_PAD = 160; // размер площадки АЗС
+const STATION_MARGIN = 30; // отступ площадки от края квартала
 
 export interface Rect {
   x: number;
@@ -43,6 +45,13 @@ export interface Park extends Rect {
   pond: { x: number; y: number; r: number } | null;
 }
 
+/** АЗС: площадка в углу квартала, въезды с двух прилегающих дорог */
+export interface Station extends Rect {
+  corner: 0 | 1 | 2 | 3; // 0 — верхний левый, 1 — верхний правый, 2 — нижний левый, 3 — нижний правый
+  bx: number; // начало квартала по x
+  by: number; // начало квартала по y
+}
+
 export interface City {
   blocks: Rect[];
   parks: Park[];
@@ -50,6 +59,7 @@ export interface City {
   billboards: Billboard[];
   trees: Tree[];
   lamps: Lamp[];
+  stations: Station[];
   roadCenters: number[];
 }
 
@@ -64,6 +74,11 @@ function mulberry32(seed: number): () => number {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+function hit(a: Rect, b: Rect): boolean {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+const grow = (r: Rect, e: number): Rect => ({ x: r.x - e, y: r.y - e, w: r.w + e * 2, h: r.h + e * 2 });
 
 const WALL_COLORS = [
   "#67584f",
@@ -165,6 +180,43 @@ export function buildCity(clients: Client[]): City {
     }
   }
 
+  /* ------- АЗС: углы кварталов, распределённые по городу ------- */
+  const stations: Station[] = [];
+  const isParkBlock = (b: Rect) => parks.some((p) => p.x === b.x && p.y === b.y);
+  const stationSpecs: Array<{ gx: number; gy: number; c: 0 | 1 | 2 | 3 }> = [
+    { gx: 0, gy: 2, c: 1 },
+    { gx: 4, gy: 1, c: 2 },
+    { gx: 2, gy: 0, c: 3 },
+    { gx: 1, gy: 4, c: 0 },
+    { gx: 3, gy: 3, c: 1 },
+    { gx: 0, gy: 0, c: 3 },
+    { gx: 4, gy: 4, c: 0 },
+    { gx: 2, gy: 3, c: 2 },
+    { gx: 3, gy: 1, c: 0 },
+    { gx: 1, gy: 1, c: 3 },
+  ];
+  for (const s of stationSpecs) {
+    if (stations.length >= 5) break;
+    const b = blocks[s.gx * GRID + s.gy];
+    if (isParkBlock(b)) continue;
+    const x = s.c === 1 || s.c === 3 ? b.x + BLOCK - STATION_PAD - STATION_MARGIN : b.x + STATION_MARGIN;
+    const y = s.c === 2 || s.c === 3 ? b.y + BLOCK - STATION_PAD - STATION_MARGIN : b.y + STATION_MARGIN;
+    const pad: Rect = { x, y, w: STATION_PAD, h: STATION_PAD };
+    if (stations.some((st) => hit(grow(st, 400), pad))) continue;
+    stations.push({ ...pad, corner: s.c, bx: b.x, by: b.y });
+  }
+
+  /* здания и деревья не должны стоять на площадке АЗС */
+  for (let i = buildings.length - 1; i >= 0; i--) {
+    if (stations.some((s) => hit(grow(s, 26), buildings[i]))) buildings.splice(i, 1);
+  }
+  for (let i = trees.length - 1; i >= 0; i--) {
+    const tr = trees[i];
+    if (stations.some((s) => tr.x > s.x - 24 && tr.x < s.x + s.w + 24 && tr.y > s.y - 24 && tr.y < s.y + s.h + 24)) {
+      trees.splice(i, 1);
+    }
+  }
+
   /* фонари вдоль дорог, мимо перекрёстков */
   const lamps: Lamp[] = [];
   const nearCenter = (v: number) => roadCenters.some((c) => Math.abs(v - c) < ROAD);
@@ -178,17 +230,22 @@ export function buildCity(clients: Client[]): City {
   }
 
   /* кандидаты под билборды — середина каждой стороны квартала, на тротуаре */
-  const candidates: Candidate[] = [];
   const BW = 132;
   const BH = 72;
+  const raw: Candidate[] = [];
   for (const b of blocks) {
     const jx = () => b.x + BLOCK * (0.3 + rng() * 0.4);
     const jy = () => b.y + BLOCK * (0.3 + rng() * 0.4);
-    candidates.push({ x: jx() - BW / 2, y: b.y + 4, vertical: false }); // верхняя сторона
-    candidates.push({ x: jx() - BW / 2, y: b.y + BLOCK - BH - 4, vertical: false }); // нижняя
-    candidates.push({ x: b.x + 4, y: jy() - BH / 2, vertical: true }); // левая
-    candidates.push({ x: b.x + BLOCK - BW - 4, y: jy() - BH / 2, vertical: true }); // правая (вертикальный щит)
+    raw.push({ x: jx() - BW / 2, y: b.y + 4, vertical: false }); // верхняя сторона
+    raw.push({ x: jx() - BW / 2, y: b.y + BLOCK - BH - 4, vertical: false }); // нижняя
+    raw.push({ x: b.x + 4, y: jy() - BH / 2, vertical: true }); // левая
+    raw.push({ x: b.x + BLOCK - BW - 4, y: jy() - BH / 2, vertical: true }); // правая (вертикальный щит)
   }
+  // не ставим щиты вплотную к заправкам
+  const candidates = raw.filter((cd) => {
+    const r: Rect = cd.vertical ? { x: cd.x, y: cd.y, w: BH, h: BW } : { x: cd.x, y: cd.y, w: BW, h: BH };
+    return !stations.some((s) => hit(grow(s, 60), r));
+  });
   // перемешать и отобрать с минимальной дистанцией
   for (let i = candidates.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
@@ -217,5 +274,5 @@ export function buildCity(clients: Client[]): City {
     );
   }
 
-  return { blocks, parks, buildings, billboards, trees, lamps, roadCenters };
+  return { blocks, parks, buildings, billboards, trees, lamps, stations, roadCenters };
 }
