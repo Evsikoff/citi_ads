@@ -59,7 +59,7 @@ const MM = 216;
 const REFUEL_RATE = 10; // л/с на работающей АЗС
 const UNLOCK_DELAY_S = 1; // через сколько секунд после заправки откроется следующая АЗС (будет формулой)
 const MIN_SESSION_L = 3; // меньше стольких литров «заправкой» не считается (проезд мимо)
-const M_PER_PX = 0.35; // метров в мировом пикселе — для дистанций на миникарте
+const M_PER_PX = 0.35; // метров в мировом пикселе — для подписей с дистанцией
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
@@ -78,6 +78,24 @@ function rgba(hex: string, a: number): string {
 
 const inView = (r: Rect, v: Rect, pad = 0) =>
   r.x + r.w >= v.x - pad && r.x <= v.x + v.w + pad && r.y + r.h >= v.y - pad && r.y <= v.y + v.h + pad;
+
+// подпись расстояния: до километра — метры с округлением до десятков
+function fmtDistance(meters: number): string {
+  return meters >= 1000
+    ? `${(meters / 1000).toFixed(1).replace(".", ",")} км`
+    : `${Math.round(meters / 10) * 10} м`;
+}
+
+// иконка АЗС (тот же контур, что у FuelIcon в интерфейсе), viewBox 24x24
+const FUEL_ICON_PATH =
+  "M5 21V6a2 2 0 012-2h5a2 2 0 012 2v15M4 21h11M14 10h2a2 2 0 012 2v5a1.5 1.5 0 003 0v-7.5L18.5 7M7 8h5v4H7z";
+let fuelIconCache: Path2D | null | undefined;
+function fuelIcon(): Path2D | null {
+  if (fuelIconCache === undefined) {
+    fuelIconCache = typeof Path2D === "function" ? new Path2D(FUEL_ICON_PATH) : null;
+  }
+  return fuelIconCache;
+}
 
 export class CityRideGame {
   private cv: HTMLCanvasElement;
@@ -801,6 +819,8 @@ export class CityRideGame {
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, w, h);
 
+    if (this.phase === "play") this.drawStationPointers(shx, shy);
+
     this.drawMinimap();
   }
 
@@ -1410,6 +1430,120 @@ export class CityRideGame {
     ctx.restore();
   }
 
+  /* ---------------- указатели на активные АЗС ---------------- */
+
+  // Зелёные стрелки по краям экрана: направление и расстояние до каждой работающей АЗС.
+  // Считаются каждый кадр от текущего положения камеры и машины, поэтому живут в реальном времени.
+  private drawStationPointers(shx: number, shy: number): void {
+    const w = this.vw;
+    const h = this.vh;
+    const zoom = this.cam.zoom;
+    // отступ от края: столько места нужно стрелке, чтобы не липнуть к рамке
+    const margin = clamp(Math.min(w, h) * 0.09, 26, 46);
+    // снизу зарезервировано место под подсказку по управлению и легенду
+    const bottom = Math.min(margin + 56, h * 0.4);
+    const l = margin;
+    const r = w - margin;
+    const t0 = margin;
+    const b0 = h - bottom;
+
+    for (const st of this.city.stations) {
+      if (st.state !== "active") continue;
+      const wx = st.x + st.w / 2;
+      const wy = st.y + st.h / 2;
+      // экранные координаты станции (с учётом тряски камеры — как и весь кадр)
+      const sx = w / 2 + shx + (wx - this.cam.x) * zoom;
+      const sy = h / 2 + shy + (wy - this.cam.y) * zoom;
+      // станция и так видна — указатель не нужен
+      if (sx > l && sx < r && sy > t0 && sy < b0) continue;
+
+      const dx = sx - w / 2;
+      const dy = sy - h / 2;
+      if (Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) continue;
+      // упираем луч «центр экрана → станция» в границы безопасной зоны
+      const tx = Math.abs(dx) > 0.001 ? ((dx > 0 ? r : l) - w / 2) / dx : Infinity;
+      const ty = Math.abs(dy) > 0.001 ? ((dy > 0 ? b0 : t0) - h / 2) / dy : Infinity;
+      const t = Math.max(Math.min(tx, ty), 0);
+      const px = w / 2 + dx * t;
+      const py = h / 2 + dy * t;
+
+      const meters = Math.hypot(wx - this.car.x, wy - this.car.y) * M_PER_PX;
+      const pulse = 0.78 + 0.22 * Math.sin(this.wall * 3 + st.x * 0.01);
+      this.drawStationPointer(px, py, Math.atan2(dy, dx), fmtDistance(meters), pulse);
+    }
+  }
+
+  private drawStationPointer(px: number, py: number, ang: number, label: string, pulse: number): void {
+    const { ctx } = this;
+    const GREEN = "#7ee08a";
+    ctx.save();
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+
+    // стрелка у края, смотрит на станцию
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(ang);
+    ctx.shadowColor = `rgba(126,224,138,${0.55 * pulse})`;
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = GREEN;
+    ctx.globalAlpha = pulse;
+    ctx.beginPath();
+    ctx.moveTo(15, 0);
+    ctx.lineTo(-6.5, 9.5);
+    ctx.lineTo(-2.5, 0);
+    ctx.lineTo(-6.5, -9.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "rgba(9,20,13,0.8)";
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.restore();
+
+    // плашка: иконка АЗС + расстояние, всегда горизонтальная — иначе не прочитать
+    const icon = 14;
+    const padX = 7;
+    const gap = 5;
+    ctx.font = '700 12px Rubik, system-ui, sans-serif';
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    const tw = ctx.measureText(label).width;
+    const bw = padX * 2 + icon + gap + tw;
+    const bh = 22;
+    // сдвигаем плашку от стрелки внутрь экрана и не даём ей вылезти за границы
+    const off = 13 + Math.max(bw, bh) * 0.4;
+    const bx = clamp(px - Math.cos(ang) * off, bw / 2 + 4, Math.max(bw / 2 + 4, this.vw - bw / 2 - 4));
+    const by = clamp(py - Math.sin(ang) * off, bh / 2 + 4, Math.max(bh / 2 + 4, this.vh - bh / 2 - 4));
+    const left = bx - bw / 2;
+    const top = by - bh / 2;
+
+    ctx.beginPath();
+    ctx.roundRect(left, top, bw, bh, 7);
+    ctx.fillStyle = "rgba(8,16,14,0.82)";
+    ctx.fill();
+    ctx.strokeStyle = `rgba(126,224,138,${0.35 + 0.25 * pulse})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    const ic = fuelIcon();
+    if (ic) {
+      ctx.save();
+      ctx.translate(left + padX, by - icon / 2);
+      ctx.scale(icon / 24, icon / 24);
+      ctx.strokeStyle = GREEN;
+      ctx.lineWidth = 2;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.stroke(ic);
+      ctx.restore();
+    }
+
+    ctx.fillStyle = "#d6f7dc";
+    ctx.fillText(label, left + padX + icon + gap, by + 0.5);
+    ctx.restore();
+  }
+
   /* ---------------- minimap ---------------- */
 
   private paintMinimapBase(): void {
@@ -1479,11 +1613,7 @@ export class CityRideGame {
           m.closePath();
           m.fill();
           // подпись с дистанцией
-          const meters = (dpx / s) * M_PER_PX;
-          const label =
-            meters >= 1000
-              ? `${(meters / 1000).toFixed(1).replace(".", ",")} км`
-              : `${Math.round(meters / 10) * 10} м`;
+          const label = fmtDistance((dpx / s) * M_PER_PX);
           const lx = (x1 + x2) / 2;
           const ly = (y1 + y2) / 2;
           m.font = "700 9px Rubik";
