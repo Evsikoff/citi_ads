@@ -1,7 +1,10 @@
-import { buildCity, WORLD, ROAD, SIDEWALK, BLOCK } from "./world";
-import type { City, Rect, Billboard, Tree, Lamp, Station } from "./world";
+import { buildCity, WORLD, ROAD, SIDEWALK, BLOCK, CANISTER_R } from "./world";
+import type { City, Rect, Billboard, Tree, Lamp, Station, Canister } from "./world";
 import type { Client } from "./clients";
 import { sfx } from "./audio";
+import { createBots, stepBot } from "./bots";
+import type { Bot } from "./bots";
+import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
 
 export interface HudData {
   speed: number;
@@ -14,6 +17,7 @@ export interface HudData {
   refueling: boolean;
   stationsActive: number;
   stationsTotal: number;
+  canisters: number;
 }
 
 export interface GameCallbacks {
@@ -24,6 +28,8 @@ export interface GameCallbacks {
   onBumpKnown(): void;
   onStationUnlock(active: number, total: number, origin: "timer" | "ad"): void;
   onStationLock(active: number, total: number): void;
+  onCanister(count: number, liters: number): void;
+  onCanisterLost(count: number, left: number): void;
 }
 
 type ParticleKind = "smoke" | "spark" | "confetti" | "leaf";
@@ -49,19 +55,23 @@ interface Skid {
   a: number;
 }
 
-const MAX_SPEED = 640;
-const ACC = 540;
-const BRAKE = 780;
 const REV_MAX = 215;
-const CAR_R = 15;
-const KMH = 0.28;
 const MM = 216;
+const FUEL_MAX_BASE = 50; // объём штатного бака
+const BOTS = 10; // ботов-конкурентов в заезде
+const PLAYERS = 1 + BOTS; // участников заезда: игрок и боты
+const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
+const CANISTER_L = 10; // на столько литров канистра увеличивает бак
 const REFUEL_RATE = 10; // л/с на работающей АЗС
-const UNLOCK_DELAY_S = 1; // через сколько секунд после заправки откроется следующая АЗС (будет формулой)
-const MIN_SESSION_L = 3; // меньше стольких литров «заправкой» не считается (проезд мимо)
-const M_PER_PX = 0.35; // метров в мировом пикселе — для дистанций на миникарте
+const UNLOCK_BASE_S = 2; // T = 2 + канистры у заправляющейся машины
+const M_PER_PX = 0.35; // метров в мировом пикселе — для подписей с дистанцией
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+
+const PLAYER_COLOR = "#e5472f"; // машина игрока — единственная красная
+
+// точка старта: середина третьей вертикальной улицы
+const START = { x: ROAD / 2 + 2 * (BLOCK + ROAD), y: WORLD * 0.66 };
 
 function shade(hex: string, f: number): string {
   const n = parseInt(hex.slice(1), 16);
@@ -78,6 +88,43 @@ function rgba(hex: string, a: number): string {
 
 const inView = (r: Rect, v: Rect, pad = 0) =>
   r.x + r.w >= v.x - pad && r.x <= v.x + v.w + pad && r.y + r.h >= v.y - pad && r.y <= v.y + v.h + pad;
+
+// подпись расстояния: до километра — метры с округлением до десятков
+function fmtDistance(meters: number): string {
+  return meters >= 1000
+    ? `${(meters / 1000).toFixed(1).replace(".", ",")} км`
+    : `${Math.round(meters / 10) * 10} м`;
+}
+
+// иконки для указателей — те же контуры, что в интерфейсе, viewBox 24x24
+const FUEL_ICON_PATH =
+  "M5 21V6a2 2 0 012-2h5a2 2 0 012 2v15M4 21h11M14 10h2a2 2 0 012 2v5a1.5 1.5 0 003 0v-7.5L18.5 7M7 8h5v4H7z";
+const CANISTER_ICON_PATH =
+  "M6 7.5A1.5 1.5 0 017.5 6h9A1.5 1.5 0 0118 7.5v11A1.5 1.5 0 0116.5 20h-9A1.5 1.5 0 016 18.5v-11zM9 6V4.5h6V6M8.5 9.5l7 7";
+const iconCache = new Map<string, Path2D | null>();
+function icon2d(path: string): Path2D | null {
+  if (!iconCache.has(path)) {
+    iconCache.set(path, typeof Path2D === "function" ? new Path2D(path) : null);
+  }
+  return iconCache.get(path) ?? null;
+}
+
+const COLLIDE_R = 19; // радиус кузова для столкновений машин
+const KICK = 1.25; // во столько раз скорость тарана превращается в отлёт
+const RAM_MIN = 70; // ниже этой скорости сближения это не таран, а тычок в пробке
+const KICK_MIN = 110; // слабый тычок всё равно должен быть заметен
+const KICK_MAX = 620;
+const STUN_S = 0.5; // сколько протараненный бот не слушается руля
+const CANISTER_COOL = 1.3; // столько выпавшую канистру нельзя подобрать
+const SPILL_R = 90; // радиус разлёта канистр от места удара
+
+const CANISTER_POINTERS = 3;
+const DEAD_POINTER_S = 1.5; // сколько указатель краснеет и моргает, прежде чем исчезнуть
+const DEAD_ACCENT = "#ff5340"; // сколько ближайших канистр показывать указателями
+
+// цвета указателей: АЗС — зелёные, канистры — голубые
+const STATION_ACCENT = "#7ee08a";
+const CANISTER_ACCENT = "#58c9f3";
 
 export class CityRideGame {
   private cv: HTMLCanvasElement;
@@ -111,8 +158,9 @@ export class CityRideGame {
   private won = false;
   private displaySpeed = 0;
 
-  private fuel = 50;
-  private readonly fuelMax = 50;
+  private fuel = FUEL_MAX_BASE;
+  private fuelMax = FUEL_MAX_BASE; // растёт с каждой подобранной канистрой
+  private canisters = 0; // канистр у игрока
   private refueling = false;
   private stalled = false;
   private gameOverSent = false;
@@ -120,9 +168,14 @@ export class CityRideGame {
   private warnCd = 0;
   private stationsActive = 0;
   private refuelStation: Station | null = null; // где сейчас идёт заправка
-  private sessionGain = 0; // сколько литров получили в текущей сессии
-  private pendingUnlock = false; // ждём открытия следующей АЗС
-  private unlockTimer = 0; // сколько секунд до открытия
+  private usedStation: Station | null = null; // площадка, с которой ещё не съехали после заправки
+  // очередь отложенных открытий: каждая занятая колонка через T секунд открывает другую
+  private unlockQueue: Array<{ t: number; from: Station; notify: boolean }> = [];
+  private bots: Bot[] = [];
+  private knock = { x: 0, y: 0 }; // отлёт машины игрока после тарана
+  private crashCd = 0; // придерживает эффекты от столкновений ботов между собой
+  // указатели на цели, которые только что увели: краснеют, моргают и гаснут
+  private deadPointers: Array<{ x: number; y: number; iconPath: string; t: number }> = [];
 
   private particles: Particle[] = [];
   private skids: Skid[] = [];
@@ -148,11 +201,12 @@ export class CityRideGame {
     this.ctx = canvas.getContext("2d")!;
     this.mini = minimap;
     if (minimap) this.mctx = minimap.getContext("2d");
-    this.city = buildCity(clients);
+    this.city = buildCity(clients, CANISTERS_ON_MAP, { x: START.x, y: START.y });
     this.total = this.city.billboards.length;
     this.cb = cb;
     this.placeCar();
     this.initStations();
+    this.bots = createBots(this.city, BOTS, START);
 
     this.mmBase = document.createElement("canvas");
     this.mmBase.width = this.mmBase.height = MM;
@@ -180,10 +234,8 @@ export class CityRideGame {
     this.time = 0;
     this.topSpeed = 0;
     this.won = false;
-    this.fuel = this.fuelMax;
-    this.stalled = false;
+    this.resetFuel();
     this.gameOverSent = false;
-    this.refueling = false;
     this.initStations();
     sfx.engineStart();
   }
@@ -204,10 +256,8 @@ export class CityRideGame {
     this.won = false;
     this.time = 0;
     this.topSpeed = 0;
-    this.fuel = this.fuelMax;
-    this.stalled = false;
+    this.resetFuel();
     this.gameOverSent = false;
-    this.refueling = false;
     this.particles = [];
     this.skids = [];
     this.placeCar();
@@ -224,9 +274,29 @@ export class CityRideGame {
     sfx.engineIdle();
   }
 
+  /** бак, канистры и разложенные по городу канистры — в исходное состояние */
+  private resetFuel(): void {
+    this.fuelMax = FUEL_MAX_BASE;
+    this.fuel = this.fuelMax;
+    this.canisters = 0;
+    this.stalled = false;
+    this.refueling = false;
+    this.refuelStation = null;
+    this.usedStation = null;
+    this.unlockQueue = [];
+    this.knock.x = 0;
+    this.knock.y = 0;
+    this.deadPointers = [];
+    for (const k of this.city.canisters) {
+      k.taken = false;
+      k.cool = 0;
+    }
+    this.bots = createBots(this.city, BOTS, START);
+  }
+
   private placeCar(): void {
-    this.car.x = this.city.roadCenters[2];
-    this.car.y = WORLD * 0.66;
+    this.car.x = START.x;
+    this.car.y = START.y;
     this.car.angle = -Math.PI / 2;
     this.car.speed = 0;
     this.cam.x = this.car.x;
@@ -316,8 +386,27 @@ export class CityRideGame {
     this.bumpCd -= dt;
     this.knownCd -= dt;
     this.leafCd -= dt;
+    this.crashCd -= dt;
 
     const c = this.car;
+
+    // на время заправки машина замирает и не слушается руля
+    if (this.refueling) {
+      c.speed = 0;
+      this.braking = false;
+      this.prevWheelL = this.prevWheelR = null;
+      this.displaySpeed += (0 - this.displaySpeed) * Math.min(1, 8 * dt);
+      this.updateFuel(dt);
+      this.updateBots(dt);
+      this.carCollisions(dt);
+      this.coolCanisters(dt);
+      this.updateParticles(dt);
+      this.fadeSkids(dt);
+      sfx.engineIdle();
+      this.emitHud();
+      return;
+    }
+
     const up = this.keys.has("up");
     const down = this.keys.has("down");
     const left = this.keys.has("left");
@@ -405,21 +494,25 @@ export class CityRideGame {
       );
     }
 
+    this.applyKnock(dt);
     this.collide();
     this.updateFuel(dt);
+    this.updateBots(dt);
+    this.carCollisions(dt);
+    this.coolCanisters(dt);
+    this.pickCanisters();
     this.updateParticles(dt);
-
-    // затухание следов
-    for (let i = this.skids.length - 1; i >= 0; i--) {
-      this.skids[i].a -= dt * 0.05;
-      if (this.skids[i].a <= 0) this.skids.splice(i, 1);
-    }
+    this.fadeSkids(dt);
 
     this.topSpeed = Math.max(this.topSpeed, sp);
     this.displaySpeed += (sp - this.displaySpeed) * Math.min(1, 8 * dt);
 
     if (this.stalled) sfx.engineIdle();
     else sfx.engine(sp / MAX_SPEED, throttle);
+    this.emitHud();
+  }
+
+  private emitHud(): void {
     this.cb.onHud({
       speed: Math.round(this.displaySpeed * KMH),
       found: this.found,
@@ -431,7 +524,322 @@ export class CityRideGame {
       refueling: this.refueling,
       stationsActive: this.stationsActive,
       stationsTotal: this.city.stations.length,
+      canisters: this.canisters,
     });
+  }
+
+  private fadeSkids(dt: number): void {
+    for (let i = this.skids.length - 1; i >= 0; i--) {
+      this.skids[i].a -= dt * 0.05;
+      if (this.skids[i].a <= 0) this.skids.splice(i, 1);
+    }
+  }
+
+  /* -------- канистры: наезд = подбор, бак становится больше -------- */
+
+  private pickCanisters(): void {
+    const c = this.car;
+    const rr = (CAR_R + CANISTER_R) * (CAR_R + CANISTER_R);
+    for (const k of this.city.canisters) {
+      if (k.taken || k.cool > 0) continue;
+      const dx = c.x - k.x;
+      const dy = c.y - k.y;
+      if (dx * dx + dy * dy > rr) continue;
+      k.taken = true;
+      this.canisters += 1;
+      this.fuelMax += CANISTER_L;
+      this.fuel = Math.min(this.fuelMax, this.fuel + CANISTER_L);
+      // канистра заводит заглохшую машину, если игра ещё не закончена
+      if (this.stalled && !this.gameOverSent) {
+        this.stalled = false;
+        sfx.engineStart();
+      }
+      for (let i = 0; i < 18; i++) {
+        this.spawn(k.x, k.y, "spark", i % 2 ? CANISTER_ACCENT : "#d8f2ff", 0.7, 150);
+      }
+      sfx.chime();
+      this.cb.onCanister(this.canisters, CANISTER_L);
+    }
+  }
+
+  /* -------- столкновения машин -------- */
+
+  /** отлёт машины игрока: живёт своей жизнью поверх газа и руля */
+  private applyKnock(dt: number): void {
+    if (!this.knock.x && !this.knock.y) return;
+    this.car.x += this.knock.x * dt;
+    this.car.y += this.knock.y * dt;
+    const decay = Math.exp(-3.4 * dt);
+    this.knock.x *= decay;
+    this.knock.y *= decay;
+    if (Math.hypot(this.knock.x, this.knock.y) < 4) {
+      this.knock.x = 0;
+      this.knock.y = 0;
+    }
+  }
+
+  private coolCanisters(dt: number): void {
+    for (const k of this.city.canisters) if (k.cool > 0) k.cool -= dt;
+    for (let i = this.deadPointers.length - 1; i >= 0; i--) {
+      this.deadPointers[i].t -= dt;
+      if (this.deadPointers[i].t <= 0) this.deadPointers.splice(i, 1);
+    }
+  }
+
+  /** цель увели: указатель на неё доживает пару мгновений красным */
+  private killPointer(x: number, y: number, iconPath: string): void {
+    this.deadPointers.push({ x, y, iconPath, t: DEAD_POINTER_S });
+  }
+
+  /**
+   * Машины таранят друг друга: пару расталкиваем, а тому, кого протаранили,
+   * добавляем отлёт «как пнули мячик». Машина, стоящая под колонкой, работает
+   * как стенка — её саму не сдвинуть.
+   */
+  private carCollisions(dt: number): void {
+    const cars: Array<{
+      x: number;
+      y: number;
+      vx: number;
+      vy: number;
+      fixed: boolean;
+      bot: Bot | null;
+    }> = [
+      {
+        x: this.car.x,
+        y: this.car.y,
+        vx: Math.cos(this.car.angle) * this.car.speed + this.knock.x,
+        vy: Math.sin(this.car.angle) * this.car.speed + this.knock.y,
+        fixed: this.refueling,
+        bot: null,
+      },
+    ];
+    for (const b of this.bots) {
+      cars.push({
+        x: b.x,
+        y: b.y,
+        vx: Math.cos(b.angle) * b.speed + b.kx,
+        vy: Math.sin(b.angle) * b.speed + b.ky,
+        fixed: b.wait > 0,
+        bot: b,
+      });
+    }
+
+    const contact = COLLIDE_R * 2;
+    for (let i = 0; i < cars.length; i++) {
+      for (let j = i + 1; j < cars.length; j++) {
+        const a = cars[i];
+        const b = cars[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let d = Math.hypot(dx, dy);
+        if (d >= contact) continue;
+        if (d < 0.001) {
+          dx = 1;
+          dy = 0;
+          d = 0.001;
+        }
+        const nx = dx / d;
+        const ny = dy / d;
+
+        // расталкиваем, чтобы кузова не слипались
+        const push = contact - d;
+        const wa = a.fixed ? 0 : b.fixed ? 1 : 0.5;
+        const wb = b.fixed ? 0 : a.fixed ? 1 : 0.5;
+        this.moveCar(a, -nx * push * wa, -ny * push * wa);
+        this.moveCar(b, nx * push * wb, ny * push * wb);
+
+        // кто в кого въехал: сравниваем сближение вдоль оси удара
+        const intoB = a.vx * nx + a.vy * ny;
+        const intoA = -(b.vx * nx + b.vy * ny);
+        // едут рядом и лишь коснулись боками — просто разъезжаются, без тарана,
+        // иначе машины в потоке бесконечно пинали бы друг друга
+        if (Math.max(intoB, intoA) < RAM_MIN) continue;
+        const aRams = intoB >= intoA;
+        const rammer = aRams ? a : b;
+        const victim = aRams ? b : a;
+        const dirX = aRams ? nx : -nx;
+        const dirY = aRams ? ny : -ny;
+        const force = clamp(Math.max(intoB, intoA) * KICK, KICK_MIN, KICK_MAX);
+
+        const cx = a.x + nx * COLLIDE_R;
+        const cy = a.y + ny * COLLIDE_R;
+        const withPlayer = a.bot === null || b.bot === null;
+        this.brakeRammer(rammer, -dirX * force * 0.16, -dirY * force * 0.16);
+        this.crashEffects(cx, cy, force, withPlayer);
+        // догнал и протаранил игрока — на этом охота заканчивается
+        if (rammer.bot && !victim.bot) {
+          rammer.bot.aggro = 0;
+          rammer.bot.aggroCd = 16 + Math.random() * 10;
+        }
+        // машина под колонкой — стенка: её не отбросить и канистры из неё не выбить
+        if (victim.fixed) continue;
+        this.kick(victim, dirX * force, dirY * force);
+        // канистры вылетают из протараненной машины
+        const carried = victim.bot ? victim.bot.taken : this.canisters;
+        if (carried > 0) this.spillCanisters(victim, carried, cx, cy);
+      }
+    }
+  }
+
+  private moveCar(c: { x: number; y: number; bot: Bot | null }, dx: number, dy: number): void {
+    if (!dx && !dy) return;
+    c.x += dx;
+    c.y += dy;
+    if (c.bot) {
+      c.bot.x = c.x;
+      c.bot.y = c.y;
+    } else {
+      this.car.x = c.x;
+      this.car.y = c.y;
+    }
+  }
+
+  private kick(c: { fixed: boolean; bot: Bot | null }, kx: number, ky: number): void {
+    if (c.fixed) return;
+    if (c.bot) {
+      c.bot.kx += kx;
+      c.bot.ky += ky;
+      c.bot.stun = STUN_S;
+      c.bot.speed *= 0.4;
+      c.bot.angle += (Math.random() - 0.5) * 0.9;
+      c.bot.think = 0;
+      // получил сдачи — охота окончена
+      c.bot.aggro = 0;
+      c.bot.aggroCd = 8 + Math.random() * 8;
+    } else {
+      this.knock.x += kx;
+      this.knock.y += ky;
+      this.car.speed *= 0.45;
+      this.cam.shake = Math.min(18, this.cam.shake + Math.hypot(kx, ky) / 42);
+    }
+  }
+
+  private brakeRammer(c: { fixed: boolean; bot: Bot | null }, kx: number, ky: number): void {
+    if (c.fixed) return;
+    if (c.bot) {
+      c.bot.kx += kx;
+      c.bot.ky += ky;
+      c.bot.speed *= 0.55;
+    } else {
+      this.knock.x += kx;
+      this.knock.y += ky;
+      this.car.speed *= 0.6;
+      this.cam.shake = Math.min(14, this.cam.shake + 4);
+    }
+  }
+
+  private crashEffects(x: number, y: number, force: number, playerInvolved: boolean): void {
+    if (!playerInvolved) {
+      // столкновений ботов между собой может быть много — эффекты придерживаем
+      if (this.crashCd > 0) return;
+      this.crashCd = 0.25;
+    }
+    const n = force > 300 ? 12 : 7;
+    for (let i = 0; i < n; i++) {
+      this.spawn(x, y, "spark", i % 2 ? "#ffd27a" : "#fff2cf", 0.5, 130);
+      this.spawn(x, y, "smoke", "rgba(150,158,175,0.4)", 0.6, 45);
+    }
+    if (playerInvolved) sfx.thud();
+  }
+
+  /** канистры протараненной машины разлетаются вокруг места удара */
+  private spillCanisters(
+    victim: { bot: Bot | null },
+    count: number,
+    x: number,
+    y: number
+  ): void {
+    const pool = this.city.canisters.filter((k) => k.taken);
+    const drop = Math.min(count, pool.length);
+    if (drop <= 0) return;
+    for (let i = 0; i < drop; i++) {
+      const k = pool[i];
+      const spot = this.spillSpot(x, y);
+      k.x = spot.x;
+      k.y = spot.y;
+      k.taken = false;
+      k.cool = CANISTER_COOL;
+      for (let s = 0; s < 8; s++) {
+        this.spawn(k.x, k.y, "spark", s % 2 ? CANISTER_ACCENT : "#d8f2ff", 0.5, 110);
+      }
+    }
+    if (victim.bot) {
+      victim.bot.taken -= drop;
+      victim.bot.gotCanister = victim.bot.taken > 0;
+      victim.bot.think = 0;
+    } else {
+      // у игрока канистра — это ещё и +10 л к баку, значит бак сдувается обратно
+      this.canisters -= drop;
+      this.fuelMax = Math.max(FUEL_MAX_BASE, this.fuelMax - drop * CANISTER_L);
+      this.fuel = Math.min(this.fuel, this.fuelMax);
+      this.cb.onCanisterLost(drop, this.canisters);
+    }
+  }
+
+  /** точка для выпавшей канистры: рядом с ударом, но не внутри здания */
+  private spillSpot(x: number, y: number): { x: number; y: number } {
+    for (let tries = 0; tries < 12; tries++) {
+      const a = Math.random() * Math.PI * 2;
+      const r = SPILL_R * (0.35 + Math.random() * 0.65);
+      const px = clamp(x + Math.cos(a) * r, 40, WORLD - 40);
+      const py = clamp(y + Math.sin(a) * r, 40, WORLD - 40);
+      const blocked = this.city.buildings.some(
+        (q) => px > q.x - 6 && px < q.x + q.w + 6 && py > q.y - 6 && py < q.y + q.h + 6
+      );
+      if (!blocked) return { x: px, y: py };
+    }
+    return { x: clamp(x, 40, WORLD - 40), y: clamp(y, 40, WORLD - 40) };
+  }
+
+  /* -------- боты-конкуренты -------- */
+
+  private updateBots(dt: number): void {
+    for (const b of this.bots) {
+      const step = stepBot(b, this.city, dt, this.car);
+      this.keepBotOutOfWalls(b);
+      if (step.took) {
+        for (let i = 0; i < 12; i++) {
+          this.spawn(b.x, b.y, "spark", i % 2 ? CANISTER_ACCENT : "#d8f2ff", 0.6, 120);
+        }
+        // указатель на эту канистру гаснет красным — её увели из-под носа
+        this.killPointer(step.took.x, step.took.y, CANISTER_ICON_PATH);
+      }
+      // бот встал под колонку — она блокируется по тем же правилам, что и у игрока,
+      // но без сообщений игроку: десять ботов иначе завалят экран тостами
+      if (step.refuelAt) this.takeStation(step.refuelAt, b.taken, false);
+    }
+  }
+
+  /** боты гоняют на скорости игрока, так что в стены их тоже надо не пускать */
+  private keepBotOutOfWalls(b: Bot): void {
+    for (const q of this.city.buildings) {
+      if (b.x < q.x - CAR_R || b.x > q.x + q.w + CAR_R || b.y < q.y - CAR_R || b.y > q.y + q.h + CAR_R) continue;
+      const px = clamp(b.x, q.x, q.x + q.w);
+      const py = clamp(b.y, q.y, q.y + q.h);
+      const dx = b.x - px;
+      const dy = b.y - py;
+      const d = Math.hypot(dx, dy);
+      if (d >= CAR_R) continue;
+      if (d < 0.001) {
+        // угодил внутрь — выталкиваем через ближайшую стену
+        const l = b.x - q.x;
+        const r = q.x + q.w - b.x;
+        const t = b.y - q.y;
+        const bt = q.y + q.h - b.y;
+        const m = Math.min(l, r, t, bt);
+        if (m === l) b.x = q.x - CAR_R;
+        else if (m === r) b.x = q.x + q.w + CAR_R;
+        else if (m === t) b.y = q.y - CAR_R;
+        else b.y = q.y + q.h + CAR_R;
+      } else {
+        const push = (CAR_R - d) / d;
+        b.x += dx * push;
+        b.y += dy * push;
+      }
+      b.speed *= 0.55;
+      b.think = 0;
+    }
   }
 
   /* -------- топливо: расход, заправка, глохнем -------- */
@@ -446,14 +854,17 @@ export class CityRideGame {
       (up && !this.stalled ? 0.24 + speed01 * 0.28 : 0) +
       (this.keys.has("hb") && sp > 250 ? 0.22 : 0);
     if (!this.stalled) {
-      this.fuel = Math.max(0, this.fuel - burn * dt);
-      if (this.fuel <= 0) {
-        this.stalled = true;
-        this.refueling = false;
-        this.cam.shake = Math.min(14, this.cam.shake + 9);
-        sfx.stall();
-        for (let i = 0; i < 16; i++) {
-          this.spawn(c.x, c.y, "smoke", "rgba(120,126,138,0.5)", 1.1, 60);
+      // под колонкой топливо не жжём — машина стоит с заглушённым мотором
+      if (!this.refueling) {
+        this.fuel = Math.max(0, this.fuel - burn * dt);
+        if (this.fuel <= 0) {
+          this.stalled = true;
+          this.refueling = false;
+          this.cam.shake = Math.min(14, this.cam.shake + 9);
+          sfx.stall();
+          for (let i = 0; i < 16; i++) {
+            this.spawn(c.x, c.y, "smoke", "rgba(120,126,138,0.5)", 1.1, 60);
+          }
         }
       }
     } else {
@@ -472,34 +883,42 @@ export class CityRideGame {
         this.cb.onGameOver({ time: this.time, found: this.found });
       }
     }
-    // отложенное открытие следующей АЗС (после заправки на «обычной» станции)
-    if (this.pendingUnlock) {
-      this.unlockTimer -= dt;
-      if (this.unlockTimer <= 0) {
-        this.pendingUnlock = false;
-        this.unlockRandom("timer");
-      }
+    // отложенные открытия: каждая занятая колонка через свои T секунд открывает другую
+    for (let i = this.unlockQueue.length - 1; i >= 0; i--) {
+      const q = this.unlockQueue[i];
+      q.t -= dt;
+      if (q.t > 0) continue;
+      this.unlockQueue.splice(i, 1);
+      this.unlockRandom("timer", q.notify, q.from);
     }
-    // заправка: только на работающих АЗС, REFUEL_RATE л/с
+    // заправка: начинаем только на работающей АЗС, но начатую сессию доводим до
+    // полного бака — колонка блокируется сразу, как только к ней встали
     let at: Station | null = null;
     if (!this.stalled) {
       for (const s of this.city.stations) {
-        if (s.state !== "active") continue;
         if (c.x > s.x - 6 && c.x < s.x + s.w + 6 && c.y > s.y - 6 && c.y < s.y + s.h + 6) {
           at = s;
           break;
         }
       }
     }
-    if (at && this.fuel < this.fuelMax) {
-      if (this.refuelStation !== at) {
-        this.endRefuelSession(); // переехали на другую колонку — закрываем прежнюю сессию
+    // повторно вставать под ту же колонку, не съехав с площадки, нельзя:
+    // иначе долитый до полного бак сразу тратит пару капель и заправка
+    // начинается заново, а машина остаётся заблокированной навсегда
+    const canStart = !!at && at.state === "active" && at !== this.usedStation;
+    const canGo = !!at && at === this.refuelStation;
+    if (at && (canStart || canGo) && this.fuel < this.fuelMax) {
+      if (!this.refueling) {
+        // машина клюнула носом и встала под колонку — колонка занята
         this.refuelStation = at;
-        this.sessionGain = 0;
+        this.takeStation(at, this.canisters, true);
+        this.cam.shake = Math.min(12, this.cam.shake + Math.abs(c.speed) / 90);
+        for (let i = 0; i < 8; i++) {
+          this.spawn(c.x, c.y, "smoke", "rgba(150,160,178,0.35)", 0.7, 40);
+        }
       }
       const was = this.fuel;
       this.fuel = Math.min(this.fuelMax, this.fuel + REFUEL_RATE * dt);
-      this.sessionGain += this.fuel - was;
       this.refueling = true;
       this.refuelSndCd -= dt;
       if (this.refuelSndCd <= 0) {
@@ -517,7 +936,9 @@ export class CityRideGame {
       }
     } else {
       this.refueling = false;
-      if (this.refuelStation) this.endRefuelSession(); // сессия закончилась — станция закрывается
+      this.refuelStation = null;
+      // пока стоим на этой площадке, новую заправку не начинаем; съехали — забываем
+      this.usedStation = at;
     }
     // предупреждение о низком баке
     if (!this.stalled && this.fuel < this.fuelMax * 0.22 && this.fuel > 0) {
@@ -529,33 +950,35 @@ export class CityRideGame {
     }
   }
 
-  /** конец сессии заправки: станция, отдавшая топливо, блокируется */
-  private endRefuelSession(): void {
-    const s = this.refuelStation;
-    this.refuelStation = null;
-    const gained = this.sessionGain;
-    this.sessionGain = 0;
-    if (!s || gained < MIN_SESSION_L) return; // короткий проезд мимо — не считается
+  /**
+   * К колонке встала машина: АЗС блокируется сразу, а через T = 2 + канистры
+   * секунд откроется другая случайная. Станция, открытая за рекламу, цепочку
+   * не запускает. notify — показывать ли игроку сообщения (для ботов молчим).
+   */
+  private takeStation(s: Station, canisters: number, notify: boolean): void {
     if (s.state !== "active") return;
     s.state = "locked";
+    this.killPointer(s.x + s.w / 2, s.y + s.h / 2, FUEL_ICON_PATH);
     this.stationsActive = Math.max(0, this.stationsActive - 1);
     const cx = s.x + s.w / 2;
     const cy = s.y + s.h / 2 - 20;
     for (let i = 0; i < 12; i++) {
       this.spawn(cx, cy, "smoke", "rgba(112,118,130,0.55)", 1.15, 55);
     }
-    sfx.stationLock();
-    this.cb.onStationLock(this.stationsActive, this.city.stations.length);
-    // станции, открытые за рекламу, не запускают цепочку — новая АЗС не открывается
-    if (s.origin !== "ad" && this.city.stations.some((x) => x.state === "locked")) {
-      this.pendingUnlock = true;
-      this.unlockTimer = UNLOCK_DELAY_S;
+    if (notify) {
+      sfx.stationLock();
+      this.cb.onStationLock(this.stationsActive, this.city.stations.length);
+    }
+    if (s.origin !== "ad") {
+      this.unlockQueue.push({ t: UNLOCK_BASE_S + canisters, from: s, notify });
     }
   }
 
   /** открыть случайную АЗС из закрытых (по таймеру или за просмотр рекламы) */
-  private unlockRandom(origin: "timer" | "ad"): void {
-    const locked = this.city.stations.filter((x) => x.state === "locked");
+  private unlockRandom(origin: "timer" | "ad", notify = true, exclude: Station | null = null): void {
+    let locked = this.city.stations.filter((x) => x.state === "locked");
+    // «другая случайная»: ту же колонку не открываем, если есть из чего выбрать
+    if (exclude && locked.some((x) => x !== exclude)) locked = locked.filter((x) => x !== exclude);
     if (!locked.length) return;
     const st = locked[Math.floor(Math.random() * locked.length)];
     st.state = "active";
@@ -566,8 +989,10 @@ export class CityRideGame {
     for (let i = 0; i < 18; i++) {
       this.spawn(cx, cy, "spark", i % 2 ? "#ffd27a" : "#7ee08a", 0.8, 260);
     }
-    sfx.unlock();
-    this.cb.onStationUnlock(this.stationsActive, this.city.stations.length, origin);
+    if (notify) {
+      sfx.unlock();
+      this.cb.onStationUnlock(this.stationsActive, this.city.stations.length, origin);
+    }
   }
 
   private pushSkid(a: { x: number; y: number }, b: { x: number; y: number }): void {
@@ -784,13 +1209,16 @@ export class CityRideGame {
     this.drawRoads(vis);
     this.drawStations(vis);
     this.drawSkids(vis);
+    this.drawCanisters(vis);
     this.drawBillboardsLayer(vis);
     this.drawTrees(vis);
     this.drawBuildings(vis);
     this.drawLamps(vis);
     this.drawParticles("smoke");
+    this.drawBots(vis);
     this.drawCar();
     this.drawParticles("solid");
+    this.drawRefuelInfo(vis);
     this.lightPass(vis);
 
     // виньетка
@@ -801,7 +1229,39 @@ export class CityRideGame {
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, w, h);
 
+    if (this.phase === "play") this.drawPointers(shx, shy);
+
     this.drawMinimap();
+  }
+
+  /** конус фар в мировых координатах (рисуется в аддитивном проходе света) */
+  private paintHeadlights(x: number, y: number, angle: number, reach: number, alpha: number): void {
+    const { ctx } = this;
+    const hx = Math.cos(angle);
+    const hy = Math.sin(angle);
+    const px = -hy;
+    const py = hx;
+    const spread = reach * 0.2;
+    for (const s of [-7, 7]) {
+      const ox = x + hx * 19 + px * s;
+      const oy = y + hy * 19 + py * s;
+      const fx = x + hx * reach;
+      const fy = y + hy * reach;
+      const g = ctx.createLinearGradient(ox, oy, fx, fy);
+      g.addColorStop(0, `rgba(255,224,158,${alpha})`);
+      g.addColorStop(1, "rgba(255,224,158,0)");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.moveTo(ox, oy);
+      ctx.lineTo(fx + px * spread, fy + py * spread);
+      ctx.lineTo(fx - px * spread, fy - py * spread);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = `rgba(255,236,190,${Math.min(0.5, alpha * 1.7)})`;
+      ctx.beginPath();
+      ctx.arc(ox, oy, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   private drawGround(vis: Rect): void {
@@ -1060,6 +1520,75 @@ export class CityRideGame {
     }
   }
 
+  private drawCanisters(vis: Rect): void {
+    const { ctx } = this;
+    for (const k of this.city.canisters) {
+      if (k.taken) continue;
+      if (!inView({ x: k.x - 36, y: k.y - 36, w: 72, h: 72 }, vis)) continue;
+      const pulse = 0.55 + 0.45 * Math.sin(this.wall * 3 + k.x * 0.01);
+      const bob = Math.sin(this.wall * 2.2 + k.y * 0.01) * 3;
+      ctx.save();
+      ctx.translate(k.x, k.y);
+
+      // подсветка на асфальте
+      const g = ctx.createRadialGradient(0, 0, 2, 0, 0, 34);
+      g.addColorStop(0, rgba(CANISTER_ACCENT, 0.34 * pulse));
+      g.addColorStop(1, rgba(CANISTER_ACCENT, 0));
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(0, 0, 34, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = "rgba(0,0,0,0.4)";
+      ctx.beginPath();
+      ctx.ellipse(0, 11, 13, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.translate(0, bob);
+      // корпус канистры
+      ctx.fillStyle = shade(CANISTER_ACCENT, 0.62);
+      ctx.beginPath();
+      ctx.roundRect(-11, -14, 22, 25, 4);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(8,22,32,0.75)";
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+      // светлая грань и рёбра жёсткости
+      ctx.fillStyle = rgba("#d8f2ff", 0.5);
+      ctx.beginPath();
+      ctx.roundRect(-8.5, -11.5, 6, 20, 2.5);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(8,26,38,0.45)";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(-1, -10);
+      ctx.lineTo(7.5, 7);
+      ctx.stroke();
+      // ручка и горловина
+      ctx.strokeStyle = shade(CANISTER_ACCENT, 0.48);
+      ctx.lineWidth = 3;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(-6, -15.5);
+      ctx.lineTo(6, -15.5);
+      ctx.stroke();
+      ctx.fillStyle = shade(CANISTER_ACCENT, 1.35);
+      ctx.beginPath();
+      ctx.arc(8.5, -13.5, 2.6, 0, Math.PI * 2);
+      ctx.fill();
+
+      // подпись «+10 л»
+      ctx.font = "700 11px Rubik, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = rgba(CANISTER_ACCENT, 0.7 + 0.3 * pulse);
+      ctx.fillText(`+${CANISTER_L} л`, 0, 24 - bob);
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      ctx.restore();
+    }
+  }
+
   private drawSkids(vis: Rect): void {
     const { ctx } = this;
     ctx.lineCap = "round";
@@ -1245,15 +1774,22 @@ export class CityRideGame {
     ctx.save();
     ctx.translate(c.x, c.y);
     ctx.rotate(c.angle + c.steer * 0.05);
+    this.paintCar(PLAYER_COLOR, this.braking);
+    ctx.restore();
+  }
+
+  /** кузов машины в её собственных координатах — общий для игрока и ботов */
+  private paintCar(color: string, braking: boolean): void {
+    const { ctx } = this;
     ctx.fillStyle = "rgba(5,8,16,0.42)";
     ctx.beginPath();
     ctx.ellipse(2, 6, 24, 15, 0, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillStyle = "#e5472f";
+    ctx.fillStyle = color;
     ctx.beginPath();
     ctx.roundRect(-20, -11, 40, 22, 8);
     ctx.fill();
-    ctx.fillStyle = "#f0593a";
+    ctx.fillStyle = shade(color, 1.08);
     ctx.beginPath();
     ctx.roundRect(8, -9, 10, 18, 4);
     ctx.fill();
@@ -1266,16 +1802,115 @@ export class CityRideGame {
     ctx.beginPath();
     ctx.roundRect(-13, -7.5, 5, 15, 2.5);
     ctx.fill();
-    ctx.fillStyle = "#c23a25";
+    ctx.fillStyle = shade(color, 0.85);
     ctx.beginPath();
     ctx.roundRect(-8, -9, 9, 18, 3);
     ctx.fill();
     ctx.fillStyle = "#ffe9b0";
     ctx.fillRect(17.5, -9, 3.5, 5);
     ctx.fillRect(17.5, 4, 3.5, 5);
-    ctx.fillStyle = this.braking ? "#ff5340" : "#8c2318";
+    ctx.fillStyle = braking ? "#ff5340" : shade(color, 0.6);
     ctx.fillRect(-21.5, -9, 3, 5);
     ctx.fillRect(-21.5, 4, 3, 5);
+  }
+
+  private drawBots(vis: Rect): void {
+    const { ctx } = this;
+    for (const b of this.bots) {
+      if (!inView({ x: b.x - 26, y: b.y - 26, w: 52, h: 52 }, vis)) continue;
+      ctx.save();
+      ctx.translate(b.x, b.y);
+      ctx.rotate(b.angle);
+      this.paintCar(b.color, b.wait > 0);
+      ctx.restore();
+      this.drawNick(b);
+    }
+  }
+
+  /** ник над машиной бота — по двум «_» его видно с первого взгляда */
+  private drawNick(b: Bot): void {
+    const { ctx } = this;
+    ctx.save();
+    ctx.font = '700 11px Rubik, system-ui, sans-serif';
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const w = ctx.measureText(b.name).width + 10;
+    const y = b.y - 26;
+    ctx.fillStyle = "rgba(8,12,20,0.72)";
+    ctx.beginPath();
+    ctx.roundRect(b.x - w / 2, y - 8, w, 16, 5);
+    ctx.fill();
+    ctx.fillStyle = b.color;
+    ctx.fillText(b.name, b.x, y + 0.5);
+    ctx.restore();
+  }
+
+  /** сколько секунд осталось до открытия следующей АЗС из-за этой колонки */
+  private unlockLeft(st: Station): number | null {
+    const q = this.unlockQueue.find((e) => e.from === st);
+    return q ? Math.max(0, q.t) : null;
+  }
+
+  /**
+   * Информер у заправляющейся машины: сколько секунд до открытия следующей АЗС
+   * и сколько канистр у того, кто стоит под колонкой.
+   */
+  private drawRefuelInfo(vis: Rect): void {
+    if (this.refueling && this.refuelStation) {
+      this.drawInfoPlate(this.car.x, this.car.y - 46, this.unlockLeft(this.refuelStation), this.canisters);
+    }
+    for (const b of this.bots) {
+      if (b.wait <= 0 || !b.at) continue;
+      if (!inView({ x: b.x - 80, y: b.y - 80, w: 160, h: 160 }, vis)) continue;
+      this.drawInfoPlate(b.x, b.y - 46, this.unlockLeft(b.at), b.taken);
+    }
+  }
+
+  private drawInfoPlate(x: number, y: number, left: number | null, canisters: number): void {
+    const { ctx } = this;
+    const timeText = left === null ? "—" : `${left.toFixed(1)} с`;
+    const canText = String(canisters);
+    ctx.save();
+    ctx.font = '700 12px Rubik, system-ui, sans-serif';
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    const icon = 13;
+    const gap = 4;
+    const pad = 8;
+    const tw = ctx.measureText(timeText).width;
+    const cw = ctx.measureText(canText).width;
+    const w = pad * 2 + icon + gap + tw + 10 + icon + gap + cw;
+    const h = 22;
+    ctx.beginPath();
+    ctx.roundRect(x - w / 2, y - h / 2, w, h, 7);
+    ctx.fillStyle = "rgba(8,14,20,0.85)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(126,224,138,0.5)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    let cx = x - w / 2 + pad;
+    const drawIcon = (path: string, color: string) => {
+      const ic = icon2d(path);
+      if (!ic) return;
+      ctx.save();
+      ctx.translate(cx, y - icon / 2);
+      ctx.scale(icon / 24, icon / 24);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.stroke(ic);
+      ctx.restore();
+      cx += icon + gap;
+    };
+    drawIcon(FUEL_ICON_PATH, STATION_ACCENT);
+    ctx.fillStyle = "#d6f7dc";
+    ctx.fillText(timeText, cx, y + 0.5);
+    cx += tw + 10;
+    drawIcon(CANISTER_ICON_PATH, CANISTER_ACCENT);
+    ctx.fillStyle = shade(CANISTER_ACCENT, 1.35);
+    ctx.fillText(canText, cx, y + 0.5);
     ctx.restore();
   }
 
@@ -1369,32 +2004,18 @@ export class CityRideGame {
       ctx.fillRect(cx - 190, cy - 190, 380, 380);
     }
 
-    // фары
+    // фары игрока и ботов
     const c = this.car;
+    this.paintHeadlights(c.x, c.y, c.angle, 235, 0.3);
+    for (const b of this.bots) {
+      if (!inView({ x: b.x - 160, y: b.y - 160, w: 320, h: 320 }, vis)) continue;
+      // фары ботов короче и тусклее — десять машин иначе засветят весь квартал
+      this.paintHeadlights(b.x, b.y, b.angle, 150, 0.16);
+    }
     const hx = Math.cos(c.angle);
     const hy = Math.sin(c.angle);
     const px = -hy;
     const py = hx;
-    for (const s of [-7, 7]) {
-      const ox = c.x + hx * 19 + px * s;
-      const oy = c.y + hy * 19 + py * s;
-      const fx = c.x + hx * 235;
-      const fy = c.y + hy * 235;
-      const g = ctx.createLinearGradient(ox, oy, fx, fy);
-      g.addColorStop(0, "rgba(255,224,158,0.3)");
-      g.addColorStop(1, "rgba(255,224,158,0)");
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.moveTo(ox, oy);
-      ctx.lineTo(fx + px * 46, fy + py * 46);
-      ctx.lineTo(fx - px * 46, fy - py * 46);
-      ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = "rgba(255,236,190,0.5)";
-      ctx.beginPath();
-      ctx.arc(ox, oy, 5, 0, Math.PI * 2);
-      ctx.fill();
-    }
     // стоп-сигналы
     if (this.braking) {
       for (const s of [-7, 7]) {
@@ -1407,6 +2028,158 @@ export class CityRideGame {
         ctx.fillRect(ox - 30, oy - 30, 60, 60);
       }
     }
+    ctx.restore();
+  }
+
+  /* ---------------- указатели на цели по краям экрана ---------------- */
+
+  // Стрелки по краям экрана: зелёные — на работающие АЗС, голубые — на канистры.
+  // Считаются каждый кадр от текущего положения камеры и машины, поэтому живут в реальном времени.
+  private drawPointers(shx: number, shy: number): void {
+    const w = this.vw;
+    const h = this.vh;
+    const zoom = this.cam.zoom;
+    // отступ от края: столько места нужно стрелке, чтобы не липнуть к рамке
+    const margin = clamp(Math.min(w, h) * 0.09, 26, 46);
+    // снизу зарезервировано место под подсказку по управлению и легенду
+    const bottom = Math.min(margin + 56, h * 0.4);
+    // на время заправки сверху висит панель — уводим указатели ниже неё
+    const top = this.refueling ? Math.min(margin + 104, h * 0.4) : margin;
+    const l = margin;
+    const r = w - margin;
+    const t0 = top;
+    const b0 = h - bottom;
+
+    const targets: Array<{ x: number; y: number; accent: string; iconPath: string }> = [];
+    for (const st of this.city.stations) {
+      if (st.state !== "active") continue;
+      targets.push({
+        x: st.x + st.w / 2,
+        y: st.y + st.h / 2,
+        accent: STATION_ACCENT,
+        iconPath: FUEL_ICON_PATH,
+      });
+    }
+    // канистр на карте много — показываем только ближайшие, иначе край экрана
+    // превращается в частокол из стрелок
+    this.city.canisters
+      .filter((k) => !k.taken)
+      .map((k) => ({ k, d: Math.hypot(k.x - this.car.x, k.y - this.car.y) }))
+      .sort((a, b) => a.d - b.d)
+      .slice(0, CANISTER_POINTERS)
+      .forEach(({ k }) =>
+        targets.push({ x: k.x, y: k.y, accent: CANISTER_ACCENT, iconPath: CANISTER_ICON_PATH })
+      );
+
+    const dead = this.deadPointers.map((d) => ({
+      x: d.x,
+      y: d.y,
+      accent: DEAD_ACCENT,
+      iconPath: d.iconPath,
+      // жёсткое мигание и затухание к концу
+      alpha: (Math.sin(this.wall * 22) > -0.25 ? 1 : 0.14) * Math.min(1, d.t / 0.4),
+    }));
+
+    for (const g of [...targets.map((t) => ({ ...t, alpha: 1 })), ...dead]) {
+      // экранные координаты цели (с учётом тряски камеры — как и весь кадр)
+      const sx = w / 2 + shx + (g.x - this.cam.x) * zoom;
+      const sy = h / 2 + shy + (g.y - this.cam.y) * zoom;
+      // цель и так видна — указатель не нужен
+      if (sx > l && sx < r && sy > t0 && sy < b0) continue;
+
+      const dx = sx - w / 2;
+      const dy = sy - h / 2;
+      if (Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) continue;
+      // упираем луч «центр экрана → цель» в границы безопасной зоны
+      const tx = Math.abs(dx) > 0.001 ? ((dx > 0 ? r : l) - w / 2) / dx : Infinity;
+      const ty = Math.abs(dy) > 0.001 ? ((dy > 0 ? b0 : t0) - h / 2) / dy : Infinity;
+      const t = Math.max(Math.min(tx, ty), 0);
+      const px = w / 2 + dx * t;
+      const py = h / 2 + dy * t;
+
+      const meters = Math.hypot(g.x - this.car.x, g.y - this.car.y) * M_PER_PX;
+      const pulse = 0.78 + 0.22 * Math.sin(this.wall * 3 + g.x * 0.01);
+      this.drawPointer(px, py, Math.atan2(dy, dx), fmtDistance(meters), pulse, g.accent, g.iconPath, g.alpha);
+    }
+  }
+
+  private drawPointer(
+    px: number,
+    py: number,
+    ang: number,
+    label: string,
+    pulse: number,
+    accent: string,
+    iconPath: string,
+    alpha = 1
+  ): void {
+    const { ctx } = this;
+    ctx.save();
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    ctx.globalAlpha = alpha;
+
+    // стрелка у края, смотрит на цель
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(ang);
+    ctx.shadowColor = rgba(accent, 0.55 * pulse);
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = accent;
+    ctx.globalAlpha = alpha * pulse;
+    ctx.beginPath();
+    ctx.moveTo(15, 0);
+    ctx.lineTo(-6.5, 9.5);
+    ctx.lineTo(-2.5, 0);
+    ctx.lineTo(-6.5, -9.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = "rgba(6,14,20,0.8)";
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.restore();
+
+    // плашка: иконка цели + расстояние, всегда горизонтальная — иначе не прочитать
+    const iconSize = 14;
+    const padX = 7;
+    const gap = 5;
+    ctx.font = '700 12px Rubik, system-ui, sans-serif';
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    const tw = ctx.measureText(label).width;
+    const bw = padX * 2 + iconSize + gap + tw;
+    const bh = 22;
+    // сдвигаем плашку от стрелки внутрь экрана и не даём ей вылезти за границы
+    const off = 13 + Math.max(bw, bh) * 0.4;
+    const bx = clamp(px - Math.cos(ang) * off, bw / 2 + 4, Math.max(bw / 2 + 4, this.vw - bw / 2 - 4));
+    const by = clamp(py - Math.sin(ang) * off, bh / 2 + 4, Math.max(bh / 2 + 4, this.vh - bh / 2 - 4));
+    const left = bx - bw / 2;
+    const top = by - bh / 2;
+
+    ctx.beginPath();
+    ctx.roundRect(left, top, bw, bh, 7);
+    ctx.fillStyle = "rgba(8,14,20,0.84)";
+    ctx.fill();
+    ctx.strokeStyle = rgba(accent, 0.35 + 0.25 * pulse);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    const ic = icon2d(iconPath);
+    if (ic) {
+      ctx.save();
+      ctx.translate(left + padX, by - iconSize / 2);
+      ctx.scale(iconSize / 24, iconSize / 24);
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 2;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.stroke(ic);
+      ctx.restore();
+    }
+
+    ctx.fillStyle = shade(accent, 1.35);
+    ctx.fillText(label, left + padX + iconSize + gap, by + 0.5);
     ctx.restore();
   }
 
@@ -1479,11 +2252,7 @@ export class CityRideGame {
           m.closePath();
           m.fill();
           // подпись с дистанцией
-          const meters = (dpx / s) * M_PER_PX;
-          const label =
-            meters >= 1000
-              ? `${(meters / 1000).toFixed(1).replace(".", ",")} км`
-              : `${Math.round(meters / 10) * 10} м`;
+          const label = fmtDistance((dpx / s) * M_PER_PX);
           const lx = (x1 + x2) / 2;
           const ly = (y1 + y2) / 2;
           m.font = "700 9px Rubik";

@@ -42,6 +42,17 @@ const FuelIcon = ({ className }: { className?: string }) => (
     />
   </svg>
 );
+const CanisterIcon = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className ?? "w-5 h-5"}>
+    <path
+      d="M6 7.5A1.5 1.5 0 017.5 6h9A1.5 1.5 0 0118 7.5v11A1.5 1.5 0 0116.5 20h-9A1.5 1.5 0 016 18.5v-11zM9 6V4.5h6V6M8.5 9.5l7 7"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
 const TrophyIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" className="w-10 h-10 text-amber-glow">
     <path
@@ -73,6 +84,11 @@ export default function App() {
   const refuelRef = useRef<HTMLSpanElement>(null);
   const lowRef = useRef<HTMLSpanElement>(null);
   const stationsCountRef = useRef<HTMLSpanElement>(null);
+  const refuelPanelRef = useRef<HTMLDivElement>(null);
+  const refuelLitersRef = useRef<HTMLSpanElement>(null);
+  const canisterCountRef = useRef<HTMLSpanElement>(null);
+  const canisterHudRef = useRef<HTMLSpanElement>(null);
+  const canisterHudCountRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
 
   const [phase, setPhase] = useState<"menu" | "play">("menu");
@@ -116,7 +132,15 @@ export default function App() {
         }
         if (fuelTextRef.current) fuelTextRef.current.textContent = `${Math.round(f)} л`;
         if (fuelIconRef.current) fuelIconRef.current.style.color = fr < 0.22 ? "#ff6b5a" : "#7ee08a";
-        if (refuelRef.current) refuelRef.current.style.opacity = h.refueling ? "1" : "0";
+        // индикатор переключаем через display: opacity перебивается анимацией anim-blink
+        if (refuelRef.current) refuelRef.current.style.display = h.refueling ? "inline" : "none";
+        if (refuelPanelRef.current) refuelPanelRef.current.style.display = h.refueling ? "flex" : "none";
+        if (h.refueling) {
+          if (refuelLitersRef.current) refuelLitersRef.current.textContent = `${Math.round(f)} / ${Math.round(fm)} л`;
+          if (canisterCountRef.current) canisterCountRef.current.textContent = String(h.canisters);
+        }
+        if (canisterHudCountRef.current) canisterHudCountRef.current.textContent = String(h.canisters);
+        if (canisterHudRef.current) canisterHudRef.current.style.opacity = h.canisters ? "1" : "0.45";
         if (lowRef.current) lowRef.current.style.display = !h.refueling && fr < 0.22 && f > 0 ? "inline" : "none";
         if (stationsCountRef.current) {
           const full = h.stationsActive >= h.stationsTotal;
@@ -138,7 +162,15 @@ export default function App() {
             : `Подвезли топливо: новая АЗС в сети — ${active} из ${total}`
         ),
       onStationLock: (active, total) =>
-        showToast(`АЗС израсходована и закрыта. Активных станций: ${active} из ${total}`),
+        showToast(`Колонка занята — АЗС закрылась. Активных станций: ${active} из ${total}`),
+      onCanister: (count, liters) =>
+        showToast(`Канистра подобрана: бак вырос на ${liters} л. Канистр у тебя: ${count}`),
+      onCanisterLost: (count, left) =>
+        showToast(
+          count > 1
+            ? `Тебя протаранили — из багажника вылетело ${count} канистры. Осталось: ${left}`
+            : `Тебя протаранили — канистра вылетела на дорогу. Осталось: ${left}`
+        ),
     });
     gameRef.current = game;
     return () => {
@@ -271,6 +303,31 @@ export default function App() {
             </div>
           </div>
 
+          {/* центр сверху: панель заправки (управление на это время заблокировано) */}
+          <div
+            ref={refuelPanelRef}
+            className="absolute top-4 left-1/2 -translate-x-1/2 z-20 pointer-events-none flex-col items-center gap-1.5 bg-night-900/92 border border-[#7ee08a]/45 rounded-xl px-5 py-3 shadow-[0_14px_40px_rgba(0,0,0,0.55)]"
+            style={{ display: "none" }}
+          >
+            <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.2em] text-[#7ee08a] font-bold anim-blink">
+              <FuelIcon className="w-4 h-4" />
+              идёт заправка
+            </span>
+            <span ref={refuelLitersRef} className="font-display text-2xl text-[#d6f7dc] tabular-nums leading-none">
+              0 / 50 л
+            </span>
+            <span className="flex items-center gap-1.5 text-[11px] text-slate-400">
+              <span className="text-[#58c9f3]">
+                <CanisterIcon className="w-4 h-4" />
+              </span>
+              канистр у тебя:
+              <span ref={canisterCountRef} className="font-display text-slate-200 tabular-nums">
+                0
+              </span>
+            </span>
+            <span className="text-[10px] text-slate-500">машина стоит — управление заблокировано</span>
+          </div>
+
           {/* левый низ: топливо и спидометр */}
           <div className="absolute bottom-4 left-4 z-10 pointer-events-none">
             <div className="bg-night-900/85 border border-night-600 rounded-lg p-3 flex flex-col gap-2.5 shadow-[0_10px_30px_rgba(0,0,0,0.4)]">
@@ -280,17 +337,30 @@ export default function App() {
                   <FuelIcon />
                 </span>
                 <div className="flex-1 min-w-0">
-                  <div className="flex justify-between items-baseline">
+                  <div className="flex justify-between items-baseline gap-2">
                     <span className="text-[9px] uppercase tracking-[0.2em] text-slate-500 font-semibold">Топливо</span>
-                    <span ref={fuelTextRef} className="font-display text-[11px] text-slate-300 tabular-nums leading-none">
-                      50 л
+                    <span className="flex items-center gap-2 shrink-0">
+                      <span
+                        ref={canisterHudRef}
+                        title="Канистр у тебя"
+                        className="flex items-center gap-0.5 text-[#58c9f3]"
+                        style={{ opacity: 0.45 }}
+                      >
+                        <CanisterIcon className="w-3 h-3" />
+                        <span ref={canisterHudCountRef} className="font-display text-[10px] tabular-nums leading-none">
+                          0
+                        </span>
+                      </span>
+                      <span ref={fuelTextRef} className="font-display text-[11px] text-slate-300 tabular-nums leading-none">
+                        50 л
+                      </span>
                     </span>
                   </div>
                   <div className="h-2.5 mt-1 bg-night-950/80 border border-night-600 rounded-sm overflow-hidden">
                     <div ref={fuelFillRef} className="h-full rounded-[1px]" style={{ width: "100%", background: "#7ee08a" }} />
                   </div>
                 </div>
-                <span ref={refuelRef} className="font-display text-[10px] text-[#7ee08a] anim-blink shrink-0" style={{ opacity: 0 }}>
+                <span ref={refuelRef} className="font-display text-[10px] text-[#7ee08a] anim-blink shrink-0" style={{ display: "none" }}>
                   ЗАПРАВКА
                 </span>
                 <span ref={lowRef} className="font-display text-[10px] text-[#ff6b5a] anim-blink shrink-0" style={{ display: "none" }}>
@@ -363,10 +433,16 @@ export default function App() {
                 <span className="w-2 h-2 rounded-[2px] bg-[#333b49] border border-[#a34a3e] inline-block" /> нет топлива
               </span>
               <span className="flex items-center gap-1">
-                <svg viewBox="0 0 24 24" fill="none" className="w-3 h-3 text-[#f2a93b]">
+                <svg viewBox="0 0 24 24" fill="none" className="w-3 h-3 text-[#7ee08a]">
                   <path d="M4 12h13M13 7l5 5-5 5" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
-                стрелка — путь и метры до АЗС
+                зелёная стрелка у края — направление и метры до работающей АЗС
+              </span>
+              <span className="flex items-center gap-1">
+                <svg viewBox="0 0 24 24" fill="none" className="w-3 h-3 text-[#58c9f3]">
+                  <path d="M4 12h13M13 7l5 5-5 5" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                голубая — до канистры (+10 л к баку)
               </span>
             </div>
           </div>
@@ -576,7 +652,8 @@ export default function App() {
             </h2>
             <p className="mt-3 text-slate-400 leading-relaxed">
               Машина заглохла посреди города. В следующий раз закладывай маршрут до АЗС —
-              оранжевые площадки «ОКТАН» отмечены на миникарте.
+              зелёная стрелка у края экрана всегда показывает направление и метры до
+              работающей колонки, голубая — до канистры.
             </p>
             <div className="mt-6 grid grid-cols-2 gap-3">
               <div className="bg-night-900/80 border border-night-700 rounded-lg py-4">
