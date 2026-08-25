@@ -154,6 +154,7 @@ export class CityRideGame {
   private warnCd = 0;
   private stationsActive = 0;
   private refuelStation: Station | null = null; // где сейчас идёт заправка
+  private usedStation: Station | null = null; // площадка, с которой ещё не съехали после заправки
   private sessionGain = 0; // сколько литров получили в текущей сессии
   private pendingUnlock = false; // ждём открытия следующей АЗС
   private unlockTimer = 0; // сколько секунд до открытия
@@ -262,6 +263,7 @@ export class CityRideGame {
     this.stalled = false;
     this.refueling = false;
     this.refuelStation = null;
+    this.usedStation = null;
     this.sessionGain = 0;
     for (const k of this.city.canisters) k.taken = false;
   }
@@ -586,7 +588,10 @@ export class CityRideGame {
         }
       }
     }
-    if (at && this.fuel < this.fuelMax) {
+    // повторно вставать под ту же колонку, не съехав с площадки, нельзя:
+    // иначе долитый до полного бак сразу тратит пару капель и заправка
+    // начинается заново, а машина остаётся заблокированной навсегда
+    if (at && at !== this.usedStation && this.fuel < this.fuelMax) {
       if (this.refuelStation !== at) {
         this.endRefuelSession(); // переехали на другую колонку — закрываем прежнюю сессию
         this.refuelStation = at;
@@ -620,6 +625,8 @@ export class CityRideGame {
     } else {
       this.refueling = false;
       if (this.refuelStation) this.endRefuelSession(); // сессия закончилась — станция закрывается
+      // пока стоим на этой площадке, новую заправку не начинаем; съехали — забываем
+      this.usedStation = at;
     }
     // предупреждение о низком баке
     if (!this.stalled && this.fuel < this.fuelMax * 0.22 && this.fuel > 0) {
