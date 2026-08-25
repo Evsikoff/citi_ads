@@ -501,7 +501,8 @@ export default function App() {
       {phase === "menu" && (
         <div className="absolute inset-0 z-30">
           <div className="absolute inset-0 bg-[linear-gradient(100deg,rgba(7,10,20,0.94)_0%,rgba(7,10,20,0.72)_42%,rgba(7,10,20,0.28)_100%)]" />
-          <div className="relative h-full flex flex-col justify-between p-5 md:p-10">
+          <div className="relative h-full overflow-y-auto">
+            <div className="min-h-full flex flex-col justify-between gap-6 p-4 md:p-8">
             {/* верхняя планка */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2.5 text-amber-glow">
@@ -525,29 +526,29 @@ export default function App() {
             </div>
 
             {/* нижний блок */}
-            <div className="flex items-end justify-between gap-8 flex-wrap md:flex-nowrap">
+            <div className="flex items-end justify-between gap-6 flex-wrap md:flex-nowrap">
               <div className="max-w-xl">
                 <div className="inline-flex items-center gap-2 rounded-full border border-amber-glow/40 bg-amber-glow/10 px-3.5 py-1.5 text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-glow">
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-glow anim-pulse-soft" />
                   вид сверху · ночная смена · {CLIENTS.length} клиентов
                 </div>
-                <h1 className="font-display text-[52px] md:text-[84px] leading-[0.95] mt-5 text-[#f2ecdf]">
+                <h1 className="font-display text-[44px] md:text-[64px] lg:text-[78px] leading-[0.95] mt-4 text-[#f2ecdf]">
                   БИЛБОРД
                   <br />
                   <span className="text-amber-glow">РАЛЛИ</span>
                 </h1>
-                <p className="mt-5 text-slate-300 leading-relaxed max-w-md">
+                <p className="mt-4 text-slate-300 leading-relaxed max-w-md">
                   Твои клиенты ждут рекламу. Гоняй по ночному району, находи свободные
                   билборды — они подсвечены янтарным — и врезайся в них, чтобы подписать
-                  контракт. Каждый щит открывает лендинг клиента — и активирует
-                  дополнительную заправку. В баке всего 50 литров, а после каждой заправки
-                  станция закрывается: следующая выйдет в сеть через секунду. Кончится
-                  топливо — смена сорвётся.
+                  контракт. Каждый щит открывает лендинг клиента и активирует
+                  дополнительную заправку. В баке всего 50 литров, колонку занимает тот,
+                  кто встал под неё первым, — а по городу за тем же топливом гоняют
+                  конкуренты. Кончится топливо — смена сорвётся.
                 </p>
-                <div className="mt-7 flex items-center gap-5 flex-wrap">
+                <div className="mt-6 flex items-center gap-5 flex-wrap">
                   <button
                     onClick={start}
-                    className="rounded-md bg-amber-glow text-night-950 font-display text-base tracking-wide px-8 py-4 hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 shadow-[0_10px_34px_rgba(255,180,84,0.4)]"
+                    className="rounded-md bg-amber-glow text-night-950 font-display text-base tracking-wide px-7 py-3.5 hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 shadow-[0_10px_34px_rgba(255,180,84,0.4)]"
                   >
                     Выехать на маршрут
                   </button>
@@ -558,9 +559,9 @@ export default function App() {
               </div>
 
               {/* карточка управления */}
-              <div className="w-full md:w-[300px] shrink-0 bg-night-900/85 border border-night-600 rounded-lg p-5 shadow-[0_20px_60px_rgba(0,0,0,0.5)]">
+              <div className="w-full md:w-[300px] shrink-0 bg-night-900/85 border border-night-600 rounded-lg p-4 shadow-[0_20px_60px_rgba(0,0,0,0.5)]">
                 <div className="text-[10px] uppercase tracking-[0.24em] text-slate-500 font-bold">Управление</div>
-                <div className="mt-4 flex flex-col gap-3 text-sm text-slate-300">
+                <div className="mt-3 flex flex-col gap-2.5 text-sm text-slate-300">
                   <div className="flex items-center gap-3">
                     <span className="flex gap-1"><span className="kbd">W</span><span className="kbd">↑</span></span> газ
                   </div>
@@ -577,25 +578,25 @@ export default function App() {
                     <span className="kbd">M</span> звук вкл/выкл
                   </div>
                 </div>
-                <div className="mt-5 pt-4 border-t border-night-700 flex items-start gap-2.5 text-xs text-slate-400 leading-relaxed">
+                <div className="mt-4 pt-3 border-t border-night-700 flex items-start gap-2.5 text-xs text-slate-400 leading-relaxed">
                   <span className="mt-1 w-2 h-2 rounded-full bg-amber-glow shrink-0 anim-pulse-soft" />
-                  Свободные щиты мигают на карте и в городе. Здания — прочные, газон — медленный.
+                  Свободные щиты мигают в городе. Здания — прочные, газон — медленный.
                 </div>
                 <div className="mt-3 pt-3 border-t border-night-700 flex items-start gap-2.5 text-xs text-slate-400 leading-relaxed">
                   <span className="mt-0.5 text-[#f2a93b] shrink-0">
                     <FuelIcon className="w-4 h-4" />
                   </span>
-                  Стартовый бак — 50 л, работающая АЗС льёт 10 л/с. Кто первым встал под колонку, тот
-                  её и занял: АЗС закрывается сразу, а другая случайная открывается через{" "}
-                  {CONFIG.stationTimeoutBase} с плюс {CONFIG.stationTimeoutPerCanister} с за каждую
-                  канистру заправляющегося. Просмотр рекламы на билборде активирует дополнительную АЗС —
-                  но заправка на ней новых станций не открывает. По городу катаются конкуренты: они тоже
-                  забирают канистры и занимают колонки. Пустой бак — начинаешь заново.
+                  <span>
+                    Бак — 50 л, АЗС льёт 10 л/с и закрывается, как только под неё встали. Другая
+                    откроется через {CONFIG.stationTimeoutBase} с плюс {CONFIG.stationTimeoutPerCanister} с
+                    за каждую канистру заправляющегося. Реклама на щите открывает ещё одну АЗС.
+                  </span>
                 </div>
               </div>
             </div>
 
-            <div className="stripes-amber h-2.5 mt-6 rounded-sm opacity-70" />
+              <div className="stripes-amber h-2.5 rounded-sm opacity-70 shrink-0" />
+            </div>
           </div>
         </div>
       )}
