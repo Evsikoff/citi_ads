@@ -9,6 +9,9 @@ export const SIDEWALK = 26; // тротуар по краю квартала
 const BUILD_INSET = 96; // здания не ближе этой границы (место под билборды)
 const STATION_PAD = 160; // размер площадки АЗС
 const STATION_MARGIN = 30; // отступ площадки от края квартала
+export const CANISTER_R = 20; // радиус канистры (он же радиус подбора)
+const CANISTER_SPREAD = 1400; // канистры не ближе этого друг к другу
+const CANISTER_FROM_START = 900; // и не под колёсами на старте
 
 export interface Rect {
   x: number;
@@ -58,6 +61,13 @@ export interface Station extends Rect {
   origin: StationOrigin; // источник активации (важно: «рекламные» не открывают следующие)
 }
 
+/** канистра: лежит на проезжей части, наезд = подбор */
+export interface Canister {
+  x: number;
+  y: number;
+  taken: boolean;
+}
+
 export interface City {
   blocks: Rect[];
   parks: Park[];
@@ -66,6 +76,7 @@ export interface City {
   trees: Tree[];
   lamps: Lamp[];
   stations: Station[];
+  canisters: Canister[];
   roadCenters: number[];
 }
 
@@ -105,7 +116,7 @@ interface Candidate {
   vertical: boolean;
 }
 
-export function buildCity(clients: Client[]): City {
+export function buildCity(clients: Client[], canisterCount = 0, start?: { x: number; y: number }): City {
   const rng = mulberry32(20260214);
 
   const roadCenters: number[] = [];
@@ -280,5 +291,27 @@ export function buildCity(clients: Client[]): City {
     );
   }
 
-  return { blocks, parks, buildings, billboards, trees, lamps, stations, roadCenters };
+  /* ------- канистры: только на проезжей части, значит игрок точно доедет ------- */
+  const canisters: Canister[] = [];
+  const onCrossing = (v: number) => roadCenters.some((c) => Math.abs(v - c) < ROAD * 0.9);
+  const spots: Array<{ x: number; y: number }> = [];
+  for (const c of roadCenters) {
+    for (let s2 = ROAD; s2 < WORLD - ROAD; s2 += 190) {
+      if (onCrossing(s2)) continue; // не на перекрёстке — там их не заметить
+      spots.push({ x: c + (rng() - 0.5) * (ROAD - 90), y: s2 }); // вертикальная улица
+      spots.push({ x: s2, y: c + (rng() - 0.5) * (ROAD - 90) }); // горизонтальная
+    }
+  }
+  for (let i = spots.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [spots[i], spots[j]] = [spots[j], spots[i]];
+  }
+  for (const sp of spots) {
+    if (canisters.length >= canisterCount) break;
+    if (start && Math.hypot(sp.x - start.x, sp.y - start.y) < CANISTER_FROM_START) continue;
+    if (canisters.some((k) => Math.hypot(k.x - sp.x, k.y - sp.y) < CANISTER_SPREAD)) continue;
+    canisters.push({ x: sp.x, y: sp.y, taken: false });
+  }
+
+  return { blocks, parks, buildings, billboards, trees, lamps, stations, canisters, roadCenters };
 }

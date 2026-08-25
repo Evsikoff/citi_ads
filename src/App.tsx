@@ -42,6 +42,17 @@ const FuelIcon = ({ className }: { className?: string }) => (
     />
   </svg>
 );
+const CanisterIcon = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className ?? "w-5 h-5"}>
+    <path
+      d="M6 7.5A1.5 1.5 0 017.5 6h9A1.5 1.5 0 0118 7.5v11A1.5 1.5 0 0116.5 20h-9A1.5 1.5 0 016 18.5v-11zM9 6V4.5h6V6M8.5 9.5l7 7"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
 const TrophyIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" className="w-10 h-10 text-amber-glow">
     <path
@@ -73,6 +84,9 @@ export default function App() {
   const refuelRef = useRef<HTMLSpanElement>(null);
   const lowRef = useRef<HTMLSpanElement>(null);
   const stationsCountRef = useRef<HTMLSpanElement>(null);
+  const refuelPanelRef = useRef<HTMLDivElement>(null);
+  const refuelLitersRef = useRef<HTMLSpanElement>(null);
+  const canisterCountRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
 
   const [phase, setPhase] = useState<"menu" | "play">("menu");
@@ -117,6 +131,11 @@ export default function App() {
         if (fuelTextRef.current) fuelTextRef.current.textContent = `${Math.round(f)} л`;
         if (fuelIconRef.current) fuelIconRef.current.style.color = fr < 0.22 ? "#ff6b5a" : "#7ee08a";
         if (refuelRef.current) refuelRef.current.style.opacity = h.refueling ? "1" : "0";
+        if (refuelPanelRef.current) refuelPanelRef.current.style.display = h.refueling ? "flex" : "none";
+        if (h.refueling) {
+          if (refuelLitersRef.current) refuelLitersRef.current.textContent = `${Math.round(f)} / ${Math.round(fm)} л`;
+          if (canisterCountRef.current) canisterCountRef.current.textContent = String(h.canisters);
+        }
         if (lowRef.current) lowRef.current.style.display = !h.refueling && fr < 0.22 && f > 0 ? "inline" : "none";
         if (stationsCountRef.current) {
           const full = h.stationsActive >= h.stationsTotal;
@@ -139,6 +158,8 @@ export default function App() {
         ),
       onStationLock: (active, total) =>
         showToast(`АЗС израсходована и закрыта. Активных станций: ${active} из ${total}`),
+      onCanister: (count, liters) =>
+        showToast(`Канистра подобрана: бак вырос на ${liters} л. Канистр у тебя: ${count}`),
     });
     gameRef.current = game;
     return () => {
@@ -269,6 +290,31 @@ export default function App() {
                 );
               })}
             </div>
+          </div>
+
+          {/* центр сверху: панель заправки (управление на это время заблокировано) */}
+          <div
+            ref={refuelPanelRef}
+            className="absolute top-4 left-1/2 -translate-x-1/2 z-20 pointer-events-none flex-col items-center gap-1.5 bg-night-900/92 border border-[#7ee08a]/45 rounded-xl px-5 py-3 shadow-[0_14px_40px_rgba(0,0,0,0.55)]"
+            style={{ display: "none" }}
+          >
+            <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.2em] text-[#7ee08a] font-bold anim-blink">
+              <FuelIcon className="w-4 h-4" />
+              идёт заправка
+            </span>
+            <span ref={refuelLitersRef} className="font-display text-2xl text-[#d6f7dc] tabular-nums leading-none">
+              0 / 50 л
+            </span>
+            <span className="flex items-center gap-1.5 text-[11px] text-slate-400">
+              <span className="text-[#7ee08a]">
+                <CanisterIcon className="w-4 h-4" />
+              </span>
+              канистр у тебя:
+              <span ref={canisterCountRef} className="font-display text-slate-200 tabular-nums">
+                0
+              </span>
+            </span>
+            <span className="text-[10px] text-slate-500">машина стоит — управление заблокировано</span>
           </div>
 
           {/* левый низ: топливо и спидометр */}

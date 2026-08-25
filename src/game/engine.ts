@@ -1,5 +1,5 @@
-import { buildCity, WORLD, ROAD, SIDEWALK, BLOCK } from "./world";
-import type { City, Rect, Billboard, Tree, Lamp, Station } from "./world";
+import { buildCity, WORLD, ROAD, SIDEWALK, BLOCK, CANISTER_R } from "./world";
+import type { City, Rect, Billboard, Tree, Lamp, Station, Canister } from "./world";
 import type { Client } from "./clients";
 import { sfx } from "./audio";
 
@@ -14,6 +14,7 @@ export interface HudData {
   refueling: boolean;
   stationsActive: number;
   stationsTotal: number;
+  canisters: number;
 }
 
 export interface GameCallbacks {
@@ -24,6 +25,7 @@ export interface GameCallbacks {
   onBumpKnown(): void;
   onStationUnlock(active: number, total: number, origin: "timer" | "ad"): void;
   onStationLock(active: number, total: number): void;
+  onCanister(count: number, liters: number): void;
 }
 
 type ParticleKind = "smoke" | "spark" | "confetti" | "leaf";
@@ -56,12 +58,19 @@ const REV_MAX = 215;
 const CAR_R = 15;
 const KMH = 0.28;
 const MM = 216;
+const FUEL_MAX_BASE = 50; // объём штатного бака
+const PLAYERS = 1; // игроков в заезде (пока один)
+const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: игроков + 1
+const CANISTER_L = 10; // на столько литров канистра увеличивает бак
 const REFUEL_RATE = 10; // л/с на работающей АЗС
 const UNLOCK_DELAY_S = 1; // через сколько секунд после заправки откроется следующая АЗС (будет формулой)
 const MIN_SESSION_L = 3; // меньше стольких литров «заправкой» не считается (проезд мимо)
 const M_PER_PX = 0.35; // метров в мировом пикселе — для подписей с дистанцией
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+
+// точка старта: середина третьей вертикальной улицы
+const START = { x: ROAD / 2 + 2 * (BLOCK + ROAD), y: WORLD * 0.66 };
 
 function shade(hex: string, f: number): string {
   const n = parseInt(hex.slice(1), 16);
@@ -129,8 +138,9 @@ export class CityRideGame {
   private won = false;
   private displaySpeed = 0;
 
-  private fuel = 50;
-  private readonly fuelMax = 50;
+  private fuel = FUEL_MAX_BASE;
+  private fuelMax = FUEL_MAX_BASE; // растёт с каждой подобранной канистрой
+  private canisters = 0; // канистр у игрока
   private refueling = false;
   private stalled = false;
   private gameOverSent = false;
@@ -166,7 +176,7 @@ export class CityRideGame {
     this.ctx = canvas.getContext("2d")!;
     this.mini = minimap;
     if (minimap) this.mctx = minimap.getContext("2d");
-    this.city = buildCity(clients);
+    this.city = buildCity(clients, CANISTERS_ON_MAP, { x: START.x, y: START.y });
     this.total = this.city.billboards.length;
     this.cb = cb;
     this.placeCar();
@@ -198,10 +208,8 @@ export class CityRideGame {
     this.time = 0;
     this.topSpeed = 0;
     this.won = false;
-    this.fuel = this.fuelMax;
-    this.stalled = false;
+    this.resetFuel();
     this.gameOverSent = false;
-    this.refueling = false;
     this.initStations();
     sfx.engineStart();
   }
@@ -222,10 +230,8 @@ export class CityRideGame {
     this.won = false;
     this.time = 0;
     this.topSpeed = 0;
-    this.fuel = this.fuelMax;
-    this.stalled = false;
+    this.resetFuel();
     this.gameOverSent = false;
-    this.refueling = false;
     this.particles = [];
     this.skids = [];
     this.placeCar();
@@ -242,9 +248,21 @@ export class CityRideGame {
     sfx.engineIdle();
   }
 
+  /** бак, канистры и разложенные по городу канистры — в исходное состояние */
+  private resetFuel(): void {
+    this.fuelMax = FUEL_MAX_BASE;
+    this.fuel = this.fuelMax;
+    this.canisters = 0;
+    this.stalled = false;
+    this.refueling = false;
+    this.refuelStation = null;
+    this.sessionGain = 0;
+    for (const k of this.city.canisters) k.taken = false;
+  }
+
   private placeCar(): void {
-    this.car.x = this.city.roadCenters[2];
-    this.car.y = WORLD * 0.66;
+    this.car.x = START.x;
+    this.car.y = START.y;
     this.car.angle = -Math.PI / 2;
     this.car.speed = 0;
     this.cam.x = this.car.x;
@@ -336,6 +354,21 @@ export class CityRideGame {
     this.leafCd -= dt;
 
     const c = this.car;
+
+    // на время заправки машина замирает и не слушается руля
+    if (this.refueling) {
+      c.speed = 0;
+      this.braking = false;
+      this.prevWheelL = this.prevWheelR = null;
+      this.displaySpeed += (0 - this.displaySpeed) * Math.min(1, 8 * dt);
+      this.updateFuel(dt);
+      this.updateParticles(dt);
+      this.fadeSkids(dt);
+      sfx.engineIdle();
+      this.emitHud();
+      return;
+    }
+
     const up = this.keys.has("up");
     const down = this.keys.has("down");
     const left = this.keys.has("left");
@@ -424,20 +457,20 @@ export class CityRideGame {
     }
 
     this.collide();
+    this.pickCanisters();
     this.updateFuel(dt);
     this.updateParticles(dt);
-
-    // затухание следов
-    for (let i = this.skids.length - 1; i >= 0; i--) {
-      this.skids[i].a -= dt * 0.05;
-      if (this.skids[i].a <= 0) this.skids.splice(i, 1);
-    }
+    this.fadeSkids(dt);
 
     this.topSpeed = Math.max(this.topSpeed, sp);
     this.displaySpeed += (sp - this.displaySpeed) * Math.min(1, 8 * dt);
 
     if (this.stalled) sfx.engineIdle();
     else sfx.engine(sp / MAX_SPEED, throttle);
+    this.emitHud();
+  }
+
+  private emitHud(): void {
     this.cb.onHud({
       speed: Math.round(this.displaySpeed * KMH),
       found: this.found,
@@ -449,7 +482,42 @@ export class CityRideGame {
       refueling: this.refueling,
       stationsActive: this.stationsActive,
       stationsTotal: this.city.stations.length,
+      canisters: this.canisters,
     });
+  }
+
+  private fadeSkids(dt: number): void {
+    for (let i = this.skids.length - 1; i >= 0; i--) {
+      this.skids[i].a -= dt * 0.05;
+      if (this.skids[i].a <= 0) this.skids.splice(i, 1);
+    }
+  }
+
+  /* -------- канистры: наезд = подбор, бак становится больше -------- */
+
+  private pickCanisters(): void {
+    const c = this.car;
+    const rr = (CAR_R + CANISTER_R) * (CAR_R + CANISTER_R);
+    for (const k of this.city.canisters) {
+      if (k.taken) continue;
+      const dx = c.x - k.x;
+      const dy = c.y - k.y;
+      if (dx * dx + dy * dy > rr) continue;
+      k.taken = true;
+      this.canisters += 1;
+      this.fuelMax += CANISTER_L;
+      this.fuel = Math.min(this.fuelMax, this.fuel + CANISTER_L);
+      // канистра заводит заглохшую машину, если игра ещё не закончена
+      if (this.stalled && !this.gameOverSent) {
+        this.stalled = false;
+        sfx.engineStart();
+      }
+      for (let i = 0; i < 18; i++) {
+        this.spawn(k.x, k.y, "spark", i % 2 ? "#7ee08a" : "#d8f7c2", 0.7, 150);
+      }
+      sfx.chime();
+      this.cb.onCanister(this.canisters, CANISTER_L);
+    }
   }
 
   /* -------- топливо: расход, заправка, глохнем -------- */
@@ -464,14 +532,17 @@ export class CityRideGame {
       (up && !this.stalled ? 0.24 + speed01 * 0.28 : 0) +
       (this.keys.has("hb") && sp > 250 ? 0.22 : 0);
     if (!this.stalled) {
-      this.fuel = Math.max(0, this.fuel - burn * dt);
-      if (this.fuel <= 0) {
-        this.stalled = true;
-        this.refueling = false;
-        this.cam.shake = Math.min(14, this.cam.shake + 9);
-        sfx.stall();
-        for (let i = 0; i < 16; i++) {
-          this.spawn(c.x, c.y, "smoke", "rgba(120,126,138,0.5)", 1.1, 60);
+      // под колонкой топливо не жжём — машина стоит с заглушённым мотором
+      if (!this.refueling) {
+        this.fuel = Math.max(0, this.fuel - burn * dt);
+        if (this.fuel <= 0) {
+          this.stalled = true;
+          this.refueling = false;
+          this.cam.shake = Math.min(14, this.cam.shake + 9);
+          sfx.stall();
+          for (let i = 0; i < 16; i++) {
+            this.spawn(c.x, c.y, "smoke", "rgba(120,126,138,0.5)", 1.1, 60);
+          }
         }
       }
     } else {
@@ -514,6 +585,13 @@ export class CityRideGame {
         this.endRefuelSession(); // переехали на другую колонку — закрываем прежнюю сессию
         this.refuelStation = at;
         this.sessionGain = 0;
+      }
+      if (!this.refueling) {
+        // машина клюнула носом и встала под колонку
+        this.cam.shake = Math.min(12, this.cam.shake + Math.abs(c.speed) / 90);
+        for (let i = 0; i < 8; i++) {
+          this.spawn(c.x, c.y, "smoke", "rgba(150,160,178,0.35)", 0.7, 40);
+        }
       }
       const was = this.fuel;
       this.fuel = Math.min(this.fuelMax, this.fuel + REFUEL_RATE * dt);
@@ -802,6 +880,7 @@ export class CityRideGame {
     this.drawRoads(vis);
     this.drawStations(vis);
     this.drawSkids(vis);
+    this.drawCanisters(vis);
     this.drawBillboardsLayer(vis);
     this.drawTrees(vis);
     this.drawBuildings(vis);
@@ -1077,6 +1156,75 @@ export class CityRideGame {
       }
       ctx.textAlign = "left";
       ctx.textBaseline = "alphabetic";
+    }
+  }
+
+  private drawCanisters(vis: Rect): void {
+    const { ctx } = this;
+    for (const k of this.city.canisters) {
+      if (k.taken) continue;
+      if (!inView({ x: k.x - 36, y: k.y - 36, w: 72, h: 72 }, vis)) continue;
+      const pulse = 0.55 + 0.45 * Math.sin(this.wall * 3 + k.x * 0.01);
+      const bob = Math.sin(this.wall * 2.2 + k.y * 0.01) * 3;
+      ctx.save();
+      ctx.translate(k.x, k.y);
+
+      // подсветка на асфальте
+      const g = ctx.createRadialGradient(0, 0, 2, 0, 0, 34);
+      g.addColorStop(0, `rgba(126,224,138,${0.34 * pulse})`);
+      g.addColorStop(1, "rgba(126,224,138,0)");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(0, 0, 34, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = "rgba(0,0,0,0.4)";
+      ctx.beginPath();
+      ctx.ellipse(0, 11, 13, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.translate(0, bob);
+      // корпус канистры
+      ctx.fillStyle = "#3f9e5c";
+      ctx.beginPath();
+      ctx.roundRect(-11, -14, 22, 25, 4);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(10,26,16,0.75)";
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+      // светлая грань и рёбра жёсткости
+      ctx.fillStyle = "rgba(180,240,190,0.5)";
+      ctx.beginPath();
+      ctx.roundRect(-8.5, -11.5, 6, 20, 2.5);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(12,32,18,0.45)";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(-1, -10);
+      ctx.lineTo(7.5, 7);
+      ctx.stroke();
+      // ручка и горловина
+      ctx.strokeStyle = "#2b7a45";
+      ctx.lineWidth = 3;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(-6, -15.5);
+      ctx.lineTo(6, -15.5);
+      ctx.stroke();
+      ctx.fillStyle = "#d9f7c6";
+      ctx.beginPath();
+      ctx.arc(8.5, -13.5, 2.6, 0, Math.PI * 2);
+      ctx.fill();
+
+      // подпись «+10 л»
+      ctx.font = "700 11px Rubik, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = `rgba(214,247,220,${0.65 + 0.35 * pulse})`;
+      ctx.fillText(`+${CANISTER_L} л`, 0, 24 - bob);
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      ctx.restore();
     }
   }
 
