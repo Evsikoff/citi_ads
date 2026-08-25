@@ -1,11 +1,13 @@
 import { ROAD, WORLD, CANISTER_R } from "./world";
 import type { Canister, City, Station } from "./world";
+import { ACC, BRAKE, MAX_SPEED, grip } from "./car";
 
 /* Боты-конкуренты: катаются по решётке улиц, забирают канистры и заправляются.
    Алгоритм каждого выбирается случайно и равновероятно из двух:
    1) "station" — еду к ближайшей активной АЗС, по пути подбираю канистру;
    2) "canister" — еду к ближайшей канистре, потом к ближайшей активной АЗС,
-      но если по пути к канистре попалась активная АЗС — заправляюсь на ней. */
+      но если по пути к канистре попалась активная АЗС — заправляюсь на ней.
+   Поверх плана бот иногда бросает дела и идёт на таран машины игрока. */
 
 export const BOT_COLORS = [
   "#3f8cff",
@@ -20,11 +22,26 @@ export const BOT_COLORS = [
   "#9aa7bd",
 ];
 
+// в нике всегда два «_» — по ним бота видно с первого взгляда
+export const BOT_NAMES = [
+  "__Вихрь",
+  "__Полночь",
+  "__Форсаж",
+  "__Клаксон",
+  "__Дизель",
+  "__Гроза",
+  "__Фара",
+  "__Турбина",
+  "__Шумахер",
+  "__Ночник",
+];
+
 export type BotPlan = "station" | "canister";
 
 type Goal =
   | { kind: "station"; x: number; y: number; st: Station }
   | { kind: "canister"; x: number; y: number; k: Canister }
+  | { kind: "player"; x: number; y: number }
   | { kind: "wander"; x: number; y: number };
 
 export interface Bot {
@@ -32,33 +49,44 @@ export interface Bot {
   y: number;
   angle: number;
   speed: number;
-  cruise: number; // своя крейсерская скорость
   color: string;
+  name: string;
   plan: BotPlan;
   goal: Goal | null;
   gotCanister: boolean; // пункт «взять канистру» выполнен
   refuelled: boolean; // пункт «заправиться» выполнен
   wait: number; // стоим под колонкой, с
+  at: Station | null; // под какой колонкой стоим
   think: number; // до пересчёта цели, с
   taken: number; // сколько канистр забрал за заезд
   kx: number; // скорость отлёта после тарана
   ky: number;
   stun: number; // пока > 0 — руль и газ не работают, машину несёт
+  // манера езды: у каждого своя, иначе колонна едет как по линейке
+  style: number; // насколько уверенно жмёт газ, 0.82..1
+  lane: number; // смещение от оси улицы — своя полоса
+  wob: number; // фаза покачивания руля
+  lazy: number; // секунды «скинул газ»
+  lazyCd: number; // до следующего такого зевка
+  aggro: number; // секунды охоты за игроком
+  aggroCd: number; // пауза между охотами
 }
 
 /** что бот сделал на этом кадре — движку нужно для эффектов и экономики АЗС */
 export interface BotStep {
-  tookCanister: boolean;
+  took: { x: number; y: number } | null; // где подобрал канистру
   refuelAt: Station | null; // на какой АЗС бот только что встал под колонку
 }
 
 const BOT_R = 15; // радиус кузова
-const LANE_EPS = 14; // насколько близко к оси улицы считается «еду по ней»
+const LANE_EPS = 60; // насколько близко к оси улицы считается «еду по ней»
 const FINAL_DIST = 190; // с этого расстояния к цели едем напрямую
 const DETOUR = 260; // цель считается «по пути», если она не дальше этого от маршрута
 const REFUEL_S = 2.4; // сколько бот стоит под колонкой
-const TURN_RATE = 3; // рад/с
 const THINK_S = 0.25; // как часто пересчитывать цель
+const AGGRO_RANGE = 1300; // с какого расстояния бот может решиться на таран
+const AGGRO_CHANCE = 0.14; // вероятность в секунду, пока игрок в радиусе
+const AGGRO_PAUSE = 14; // сколько ждать до следующей охоты
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
@@ -201,17 +229,64 @@ function applyKnock(b: Bot, dt: number): void {
   }
 }
 
+/**
+ * Езда «как человек»: целимся не в саму точку маршрута, а в свою полосу рядом с
+ * ней, слегка водим рулём, разгоняемся до потолка игрока и тормозим перед
+ * поворотами. Поворотливость и разгон — те же, что у машины игрока.
+ */
 function drive(b: Bot, wx: number, wy: number, dt: number): void {
-  const want = Math.atan2(wy - b.y, wx - b.x);
+  const dx = wx - b.x;
+  const dy = wy - b.y;
+  const len = Math.hypot(dx, dy) || 1;
+  // прицел сдвинут вбок: своя полоса плюс лёгкое покачивание
+  const px = -dy / len;
+  const py = dx / len;
+  const off = b.lane + Math.sin(b.wob) * 7;
+  const want = Math.atan2(wy + py * off - b.y, wx + px * off - b.x);
+
   let d = want - b.angle;
   while (d > Math.PI) d -= Math.PI * 2;
   while (d < -Math.PI) d += Math.PI * 2;
-  b.angle += Math.sign(d) * Math.min(Math.abs(d), TURN_RATE * dt);
+  const maxTurn = 3.1 * Math.max(grip(b.speed), 0.32);
+  b.angle += Math.sign(d) * Math.min(Math.abs(d), maxTurn * dt);
+
   const ad = Math.abs(d);
-  const slow = ad > 0.7 ? 0.35 : ad > 0.25 ? 0.7 : 1;
-  b.speed += (b.cruise * slow - b.speed) * Math.min(1, 4 * dt);
+  let target = MAX_SPEED * b.style;
+  target = Math.min(target, len * 2.4 + 120); // в поворот входим не на полном газу
+  if (ad > 0.8) target = Math.min(target, MAX_SPEED * 0.26);
+  else if (ad > 0.35) target = Math.min(target, MAX_SPEED * 0.55);
+  if (b.lazy > 0) target *= 0.55; // зевок: скинул газ и катится
+  b.speed = b.speed < target ? Math.min(target, b.speed + ACC * dt) : Math.max(target, b.speed - BRAKE * dt);
+
   b.x = clamp(b.x + Math.cos(b.angle) * b.speed * dt, 30, WORLD - 30);
   b.y = clamp(b.y + Math.sin(b.angle) * b.speed * dt, 30, WORLD - 30);
+}
+
+/** мелкая живость: покачивание руля, случайные зевки, решение пойти на таран */
+function updateMood(b: Bot, dt: number, player: { x: number; y: number }): void {
+  b.wob += dt * (0.7 + b.style);
+  if (b.lazy > 0) b.lazy -= dt;
+  else {
+    b.lazyCd -= dt;
+    if (b.lazyCd <= 0) {
+      b.lazy = Math.random() < 0.45 ? 0.35 + Math.random() * 1.1 : 0;
+      b.lazyCd = 2.5 + Math.random() * 4.5;
+    }
+  }
+
+  if (b.aggro > 0) {
+    b.aggro -= dt;
+    if (b.aggro <= 0) b.aggroCd = AGGRO_PAUSE + Math.random() * 12;
+    return;
+  }
+  b.aggroCd -= dt;
+  if (b.aggroCd > 0) return;
+  const d = Math.hypot(player.x - b.x, player.y - b.y);
+  if (d < AGGRO_RANGE && Math.random() < AGGRO_CHANCE * dt) {
+    b.aggro = 3.5 + Math.random() * 3.5; // столько секунд будет висеть на хвосте
+    b.goal = null;
+    b.think = 0;
+  }
 }
 
 export function createBots(city: City, count: number, start: { x: number; y: number }): Bot[] {
@@ -235,18 +310,26 @@ export function createBots(city: City, count: number, start: { x: number; y: num
       y,
       angle: vertical ? (Math.random() < 0.5 ? -Math.PI / 2 : Math.PI / 2) : Math.random() < 0.5 ? 0 : Math.PI,
       speed: 0,
-      cruise: 165 + Math.random() * 95,
       color: BOT_COLORS[i % BOT_COLORS.length],
+      name: BOT_NAMES[i % BOT_NAMES.length],
       plan: "station",
       goal: null,
       gotCanister: false,
       refuelled: false,
       wait: 0,
+      at: null,
       think: 0,
       taken: 0,
       kx: 0,
       ky: 0,
       stun: 0,
+      style: 0.82 + Math.random() * 0.18,
+      lane: (Math.random() < 0.5 ? -1 : 1) * (18 + Math.random() * 26),
+      wob: Math.random() * Math.PI * 2,
+      lazy: 0,
+      lazyCd: Math.random() * 4,
+      aggro: 0,
+      aggroCd: 4 + Math.random() * 14,
     };
     rollPlan(bot);
     bots.push(bot);
@@ -254,8 +337,8 @@ export function createBots(city: City, count: number, start: { x: number; y: num
   return bots;
 }
 
-export function stepBot(b: Bot, city: City, dt: number): BotStep {
-  const step: BotStep = { tookCanister: false, refuelAt: null };
+export function stepBot(b: Bot, city: City, dt: number, player: { x: number; y: number }): BotStep {
+  const step: BotStep = { took: null, refuelAt: null };
   applyKnock(b, dt);
   if (b.stun > 0) {
     // получил в бок — пару мгновений машину просто несёт
@@ -268,13 +351,21 @@ export function stepBot(b: Bot, city: City, dt: number): BotStep {
     // стоим под колонкой
     b.wait -= dt;
     b.speed *= Math.max(0, 1 - 6 * dt);
+    if (b.wait <= 0) b.at = null;
     return step;
   }
 
-  b.think -= dt;
-  if (!b.goal || b.think <= 0 || goalStale(b.goal)) {
-    b.goal = chooseGoal(b, city);
-    b.think = THINK_S;
+  updateMood(b, dt, player);
+
+  if (b.aggro > 0) {
+    // охота: цель — машина игрока, она движется, поэтому обновляем каждый кадр
+    b.goal = { kind: "player", x: player.x, y: player.y };
+  } else {
+    b.think -= dt;
+    if (!b.goal || b.goal.kind === "player" || b.think <= 0 || goalStale(b.goal)) {
+      b.goal = chooseGoal(b, city);
+      b.think = THINK_S * (0.7 + Math.random() * 0.6);
+    }
   }
   const g = b.goal;
   const wp = waypoint(b, city, g.x, g.y);
@@ -291,13 +382,14 @@ export function stepBot(b: Bot, city: City, dt: number): BotStep {
     b.gotCanister = true;
     b.taken += 1;
     b.think = 0;
-    step.tookCanister = true;
+    step.took = { x: k.x, y: k.y };
   }
 
   if (g.kind === "station") {
     const s = g.st;
     if (s.state === "active" && b.x > s.x - 6 && b.x < s.x + s.w + 6 && b.y > s.y - 6 && b.y < s.y + s.h + 6) {
       b.wait = REFUEL_S;
+      b.at = s;
       b.refuelled = true;
       b.goal = null;
       b.think = 0;
