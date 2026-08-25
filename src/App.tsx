@@ -8,6 +8,8 @@ import { sfx } from "./game/audio";
 import { CONFIG } from "./game/config";
 import { ClientModal } from "./components/ClientModal";
 
+const fmtMoney = (v: number) => Math.round(v).toLocaleString("ru-RU");
+
 const fmt = (t: number) => {
   const m = Math.floor(t / 60);
   const s = Math.floor(t % 60);
@@ -41,6 +43,13 @@ const FuelIcon = ({ className }: { className?: string }) => (
       strokeLinecap="round"
       strokeLinejoin="round"
     />
+  </svg>
+);
+const MoneyIcon = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className ?? "w-5 h-5"}>
+    <rect x="3" y="7" width="18" height="10" rx="1.5" stroke="currentColor" strokeWidth="1.8" />
+    <circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="1.8" />
+    <path d="M7 7v10M17 7v10" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
   </svg>
 );
 const CanisterIcon = ({ className }: { className?: string }) => (
@@ -90,6 +99,9 @@ export default function App() {
   const canisterCountRef = useRef<HTMLSpanElement>(null);
   const canisterHudRef = useRef<HTMLSpanElement>(null);
   const canisterHudCountRef = useRef<HTMLSpanElement>(null);
+  const moneyRef = useRef<HTMLSpanElement>(null);
+  const refuelPriceRef = useRef<HTMLSpanElement>(null);
+  const refuelLimitRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
 
   const [phase, setPhase] = useState<"menu" | "play">("menu");
@@ -99,6 +111,8 @@ export default function App() {
   const [win, setWin] = useState<{ time: number; top: number } | null>(null);
   const [gameover, setGameover] = useState<{ time: number; found: number } | null>(null);
   const [toast, setToast] = useState<{ id: number; msg: string } | null>(null);
+  const [sell, setSell] = useState<{ fuel: number; price: number } | null>(null);
+  const [sellLiters, setSellLiters] = useState(0);
   const [touch] = useState(
     () => typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches
   );
@@ -140,6 +154,14 @@ export default function App() {
           if (refuelLitersRef.current) refuelLitersRef.current.textContent = `${Math.round(f)} / ${Math.round(fm)} л`;
           if (canisterCountRef.current) canisterCountRef.current.textContent = String(h.canisters);
         }
+        if (moneyRef.current) moneyRef.current.textContent = fmtMoney(h.money);
+        if (h.refueling) {
+          if (refuelPriceRef.current) refuelPriceRef.current.textContent = `${h.refuelPrice} ₽/л · отдано ${fmtMoney(h.refuelSpent)} ₽`;
+          if (refuelLimitRef.current) {
+            refuelLimitRef.current.textContent =
+              h.refuelLeft === null ? "" : `лимит колонки: ещё ${h.refuelLeft.toFixed(1)} л`;
+          }
+        }
         if (canisterHudCountRef.current) canisterHudCountRef.current.textContent = String(h.canisters);
         if (canisterHudRef.current) canisterHudRef.current.style.opacity = h.canisters ? "1" : "0.45";
         if (lowRef.current) lowRef.current.style.display = !h.refueling && fr < 0.22 && f > 0 ? "inline" : "none";
@@ -166,6 +188,16 @@ export default function App() {
         showToast(`Колонка занята — АЗС закрылась. Активных станций: ${active} из ${total}`),
       onCanister: (count, liters) =>
         showToast(`Канистра подобрана: бак вырос на ${liters} л (топливо не прибавилось). Канистр у тебя: ${count}`),
+      onRefuelStop: (reason) =>
+        showToast(
+          reason === "limit"
+            ? `Колонка отпускает не больше ${CONFIG.stationFuelLimit} л за раз — бак долить не дали`
+            : "Деньги кончились — колонка перестала лить"
+        ),
+      onBase: (fuel, price) => {
+        setSell({ fuel, price });
+        setSellLiters(Math.floor(fuel));
+      },
       onCanisterLost: (count, left) =>
         showToast(
           count > 1
@@ -182,8 +214,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    gameRef.current?.setPaused(!!modal);
-  }, [modal]);
+    gameRef.current?.setPaused(!!modal || !!sell);
+  }, [modal, sell]);
 
   const start = () => {
     sfx.init();
@@ -269,6 +301,16 @@ export default function App() {
               </svg>
               в пути <span ref={timerRef} className="text-slate-200 font-semibold tabular-nums">0:00</span>
             </div>
+            <div className="flex items-center gap-2 bg-night-900/85 border border-night-600 rounded-md px-3 py-1.5 text-xs text-slate-400">
+              <span className="text-[#ffd27a]">
+                <MoneyIcon className="w-3.5 h-3.5" />
+              </span>
+              касса
+              <span ref={moneyRef} className="font-display text-sm text-[#ffd27a] tabular-nums">
+                {fmtMoney(CONFIG.startMoney)}
+              </span>
+              ₽
+            </div>
           </div>
 
           {/* правый верх: портфель клиентов */}
@@ -326,6 +368,10 @@ export default function App() {
                 0
               </span>
             </span>
+            <span ref={refuelPriceRef} className="text-[11px] text-[#ffd27a] tabular-nums">
+              0 ₽/л
+            </span>
+            <span ref={refuelLimitRef} className="text-[10px] text-[#ff9f6b] tabular-nums" />
             <span className="text-[10px] text-slate-500">машина стоит — управление заблокировано</span>
           </div>
 
@@ -587,9 +633,11 @@ export default function App() {
                     <FuelIcon className="w-4 h-4" />
                   </span>
                   <span>
-                    Бак — 50 л, АЗС льёт 10 л/с и закрывается, как только под неё встали. Другая
-                    откроется через {CONFIG.stationTimeoutBase} с плюс {CONFIG.stationTimeoutPerCanister} с
-                    за каждую канистру заправляющегося. Реклама на щите открывает ещё одну АЗС.
+                    Бак — {CONFIG.startTankVolume} л, литр на АЗС стоит {CONFIG.stationPriceMin}–
+                    {CONFIG.stationPriceMax} ₽, у каждой колонки цена своя, иногда с лимитом отпуска.
+                    Колонка закрывается, как только под неё встали; другая откроется через{" "}
+                    {CONFIG.stationTimeoutBase} с плюс {CONFIG.stationTimeoutPerCanister} с за канистру.
+                    База на отшибе скупает бензин по {CONFIG.fuelSellPrice} ₽ — на этом и живём.
                   </span>
                 </div>
               </div>
@@ -680,6 +728,75 @@ export default function App() {
             </button>
             <div className="mt-3 text-xs text-slate-500">
               или нажми <span className="kbd">ENTER</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= база: продажа бензина ================= */}
+      {sell && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-[rgba(5,8,16,0.66)] anim-fade" />
+          <div className="relative w-full max-w-md bg-night-800 border border-[#b98cff]/40 rounded-xl p-6 anim-pop shadow-[0_30px_90px_rgba(0,0,0,0.65)]">
+            <div className="flex items-center gap-2 text-[10px] uppercase tracking-[0.22em] text-[#b98cff] font-bold">
+              <MoneyIcon className="w-4 h-4" />
+              база · скупка топлива
+            </div>
+            <h2 className="font-display text-2xl mt-3 text-[#f2ecdf]">Сколько сливаем?</h2>
+            <p className="mt-2 text-sm text-slate-400 leading-relaxed">
+              Принимают по {sell.price} ₽ за литр, без вопросов. В баке{" "}
+              <span className="text-slate-200 tabular-nums">{sell.fuel.toFixed(1)} л</span> — но домой ещё
+              ехать.
+            </p>
+
+            <div className="mt-5 flex items-baseline justify-between">
+              <span className="font-display text-4xl text-[#f2ecdf] tabular-nums">
+                {sellLiters}
+                <span className="text-base text-slate-500 ml-1">л</span>
+              </span>
+              <span className="font-display text-2xl text-[#ffd27a] tabular-nums">
+                +{fmtMoney(sellLiters * sell.price)} ₽
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={Math.floor(sell.fuel)}
+              step={1}
+              value={sellLiters}
+              onChange={(e) => setSellLiters(Number(e.target.value))}
+              className="mt-3 w-full accent-[#b98cff]"
+            />
+            <div className="mt-3 flex gap-2">
+              {[0.25, 0.5, 0.75, 1].map((f) => (
+                <button
+                  key={f}
+                  onClick={() => setSellLiters(Math.floor(sell.fuel * f))}
+                  className="flex-1 rounded-md border border-night-600 bg-night-900/70 py-2 text-xs text-slate-300 hover:border-[#b98cff]/60 hover:text-[#f2ecdf] transition-colors"
+                >
+                  {Math.round(f * 100)}%
+                </button>
+              ))}
+            </div>
+
+            <div className="mt-6 flex gap-3">
+              <button
+                onClick={() => {
+                  const paid = gameRef.current?.sellFuel(sellLiters) ?? 0;
+                  if (paid > 0) showToast(`Слито ${sellLiters} л — касса пополнилась на ${fmtMoney(paid)} ₽`);
+                  setSell(null);
+                }}
+                disabled={sellLiters <= 0}
+                className="flex-1 rounded-md bg-[#b98cff] text-night-950 font-display py-3 hover:brightness-110 disabled:opacity-40 disabled:hover:brightness-100 transition-all"
+              >
+                Слить и получить деньги
+              </button>
+              <button
+                onClick={() => setSell(null)}
+                className="rounded-md border border-night-600 px-5 text-sm text-slate-400 hover:text-slate-200 transition-colors"
+              >
+                Уехать
+              </button>
             </div>
           </div>
         </div>

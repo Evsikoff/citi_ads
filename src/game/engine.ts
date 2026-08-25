@@ -19,6 +19,13 @@ export interface HudData {
   stationsActive: number;
   stationsTotal: number;
   canisters: number;
+  money: number;
+  /** цена литра на колонке, под которой стоим, — только во время заправки */
+  refuelPrice: number;
+  /** сколько рублей уже отдали в текущей заправке */
+  refuelSpent: number;
+  /** остаток лимита колонки в литрах; null — колонка без ограничения */
+  refuelLeft: number | null;
 }
 
 export interface GameCallbacks {
@@ -31,6 +38,10 @@ export interface GameCallbacks {
   onStationLock(active: number, total: number): void;
   onCanister(count: number, liters: number): void;
   onCanisterLost(count: number, left: number): void;
+  /** заправка прервалась не из-за полного бака */
+  onRefuelStop(reason: "limit" | "money"): void;
+  /** машина заехала на базу нелегальной скупки — игроку предлагают продать бензин */
+  onBase(fuel: number, price: number): void;
 }
 
 type ParticleKind = "smoke" | "spark" | "confetti" | "leaf";
@@ -58,7 +69,6 @@ interface Skid {
 
 const REV_MAX = 215;
 const MM = 216;
-const FUEL_MAX_BASE = 50; // объём штатного бака
 const BOTS = 10; // ботов-конкурентов в заезде
 const PLAYERS = 1 + BOTS; // участников заезда: игрок и боты
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
@@ -123,9 +133,12 @@ const CANISTER_POINTERS = 3;
 const DEAD_POINTER_S = 1.5; // сколько указатель краснеет и моргает, прежде чем исчезнуть
 const DEAD_ACCENT = "#ff5340"; // сколько ближайших канистр показывать указателями
 
-// цвета указателей: АЗС — зелёные, канистры — голубые
+// цвета указателей: АЗС — зелёные, канистры — голубые, база — фиолетовая
 const STATION_ACCENT = "#7ee08a";
 const CANISTER_ACCENT = "#58c9f3";
+const BASE_ACCENT = "#b98cff";
+// иконка базы — пачка купюр
+const BASE_ICON_PATH = "M3 7h18v10H3V7zm4 0v10M17 7v10M12 9.5a2.5 2.5 0 000 5 2.5 2.5 0 000-5z";
 
 export class CityRideGame {
   private cv: HTMLCanvasElement;
@@ -159,9 +172,13 @@ export class CityRideGame {
   private won = false;
   private displaySpeed = 0;
 
-  private fuel = FUEL_MAX_BASE;
-  private fuelMax = FUEL_MAX_BASE; // растёт с каждой подобранной канистрой
+  private fuel = CONFIG.startFuel;
+  private fuelMax = CONFIG.startTankVolume; // растёт с каждой подобранной канистрой
   private canisters = 0; // канистр у игрока
+  private money = CONFIG.startMoney; // рублей на счету
+  private sessionLiters = 0; // сколько литров налили на этой колонке
+  private sessionSpent = 0; // и сколько рублей за них отдали
+  private atBase = false; // стоим на площадке базы — второй раз не предлагаем
   private refueling = false;
   private stalled = false;
   private gameOverSent = false;
@@ -275,10 +292,14 @@ export class CityRideGame {
     sfx.engineIdle();
   }
 
-  /** бак, канистры и разложенные по городу канистры — в исходное состояние */
+  /** бак, деньги, канистры и разложенные по городу канистры — в исходное состояние */
   private resetFuel(): void {
-    this.fuelMax = FUEL_MAX_BASE;
-    this.fuel = this.fuelMax;
+    this.fuelMax = CONFIG.startTankVolume;
+    this.fuel = Math.min(CONFIG.startFuel, this.fuelMax);
+    this.money = CONFIG.startMoney;
+    this.sessionLiters = 0;
+    this.sessionSpent = 0;
+    this.atBase = false;
     this.canisters = 0;
     this.stalled = false;
     this.refueling = false;
@@ -304,6 +325,18 @@ export class CityRideGame {
     this.cam.y = this.car.y;
   }
 
+  /**
+   * Новая смена на колонке: цена литра берётся случайно между границами из
+   * конфига, а ограничение на отпуск выпадает с указанной там вероятностью.
+   * Крутится при каждой активации станции — цены по городу живые.
+   */
+  private rollStationOffer(st: Station): void {
+    const lo = CONFIG.stationPriceMin;
+    const hi = Math.max(lo, CONFIG.stationPriceMax);
+    st.price = Math.round(lo + Math.random() * (hi - lo));
+    st.limit = Math.random() < CONFIG.stationLimitChance ? CONFIG.stationFuelLimit : null;
+  }
+
   /** по умолчанию работает одна АЗС — ближайшая к старту */
   private initStations(): void {
     let best: Station | null = null;
@@ -319,6 +352,7 @@ export class CityRideGame {
     if (best) {
       best.state = "active";
       best.origin = "start";
+      this.rollStationOffer(best);
     }
     this.stationsActive = best ? 1 : 0;
   }
@@ -497,6 +531,7 @@ export class CityRideGame {
 
     this.applyKnock(dt);
     this.collide();
+    this.checkBase();
     this.updateFuel(dt);
     this.updateBots(dt);
     this.carCollisions(dt);
@@ -526,6 +561,13 @@ export class CityRideGame {
       stationsActive: this.stationsActive,
       stationsTotal: this.city.stations.length,
       canisters: this.canisters,
+      money: this.money,
+      refuelPrice: this.refuelStation ? this.refuelStation.price : 0,
+      refuelSpent: this.sessionSpent,
+      refuelLeft:
+        this.refuelStation && this.refuelStation.limit !== null
+          ? Math.max(0, this.refuelStation.limit - this.sessionLiters)
+          : null,
     });
   }
 
@@ -534,6 +576,39 @@ export class CityRideGame {
       this.skids[i].a -= dt * 0.05;
       if (this.skids[i].a <= 0) this.skids.splice(i, 1);
     }
+  }
+
+  /* -------- база нелегальной скупки -------- */
+
+  /** въехали на площадку базы — предлагаем продать бензин (один раз за заезд на неё) */
+  private checkBase(): void {
+    const b = this.city.base;
+    const c = this.car;
+    const inside = c.x > b.x - 6 && c.x < b.x + b.w + 6 && c.y > b.y - 6 && c.y < b.y + b.h + 6;
+    if (!inside) {
+      this.atBase = false;
+      return;
+    }
+    if (this.atBase || this.stalled) return;
+    this.atBase = true;
+    if (this.fuel < 0.5) return; // сливать нечего
+    this.cb.onBase(this.fuel, CONFIG.fuelSellPrice);
+  }
+
+  /** продать литры базе: возвращает, сколько рублей выручили */
+  sellFuel(liters: number): number {
+    const sold = clamp(liters, 0, this.fuel);
+    if (sold <= 0) return 0;
+    this.fuel -= sold;
+    const paid = Math.round(sold * CONFIG.fuelSellPrice);
+    this.money += paid;
+    const b = this.city.base;
+    for (let i = 0; i < 20; i++) {
+      this.spawn(b.x + b.w / 2, b.y + b.h / 2, "confetti", i % 2 ? "#ffd27a" : "#7ee08a", 0.9, 240);
+    }
+    sfx.chime();
+    this.emitHud();
+    return paid;
   }
 
   /* -------- канистры: наезд = подбор, бак становится больше -------- */
@@ -767,7 +842,7 @@ export class CityRideGame {
     } else {
       // у игрока канистра — это ещё и +10 л к баку, значит бак сдувается обратно
       this.canisters -= drop;
-      this.fuelMax = Math.max(FUEL_MAX_BASE, this.fuelMax - drop * CANISTER_L);
+      this.fuelMax = Math.max(CONFIG.startTankVolume, this.fuelMax - drop * CANISTER_L);
       this.fuel = Math.min(this.fuel, this.fuelMax);
       this.cb.onCanisterLost(drop, this.canisters);
     }
@@ -803,6 +878,11 @@ export class CityRideGame {
       }
       // бот встал под колонку — она блокируется по тем же правилам, что и у игрока,
       // но без сообщений игроку: десять ботов иначе завалят экран тостами
+      if (step.soldAt) {
+        for (let i = 0; i < 10; i++) {
+          this.spawn(step.soldAt.x, step.soldAt.y, "confetti", i % 2 ? "#ffd27a" : BASE_ACCENT, 0.8, 200);
+        }
+      }
       if (step.refuelAt) this.takeStation(step.refuelAt, b.taken, false);
     }
   }
@@ -905,10 +985,24 @@ export class CityRideGame {
     // начинается заново, а машина остаётся заблокированной навсегда
     const canStart = !!at && at.state === "active" && at !== this.usedStation;
     const canGo = !!at && at === this.refuelStation;
-    if (at && (canStart || canGo) && this.fuel < this.fuelMax) {
+    // сколько литров реально можем взять на этом кадре: место в баке, лимит
+    // колонки и деньги в кармане — что первым закончится, то и остановит
+    let step = 0;
+    let stop: "limit" | "money" | null = null;
+    if (at && (canStart || canGo)) {
+      const poured = canGo ? this.sessionLiters : 0;
+      const room = this.fuelMax - this.fuel;
+      const allowance = at.limit === null ? Infinity : Math.max(0, at.limit - poured);
+      const affordable = at.price > 0 ? this.money / at.price : Infinity;
+      step = Math.min(REFUEL_RATE * dt, room, allowance, affordable);
+      if (step <= 0.0005 && room > 0.05) stop = allowance <= 0.0005 ? "limit" : "money";
+    }
+    if (at && (canStart || canGo) && step > 0.0005) {
       if (!this.refueling) {
         // машина клюнула носом и встала под колонку — колонка занята
         this.refuelStation = at;
+        this.sessionLiters = 0;
+        this.sessionSpent = 0;
         this.takeStation(at, this.canisters, true);
         this.cam.shake = Math.min(12, this.cam.shake + Math.abs(c.speed) / 90);
         for (let i = 0; i < 8; i++) {
@@ -916,7 +1010,11 @@ export class CityRideGame {
         }
       }
       const was = this.fuel;
-      this.fuel = Math.min(this.fuelMax, this.fuel + REFUEL_RATE * dt);
+      this.fuel = Math.min(this.fuelMax, this.fuel + step);
+      const paid = (this.fuel - was) * at.price;
+      this.money = Math.max(0, this.money - paid);
+      this.sessionLiters += this.fuel - was;
+      this.sessionSpent += paid;
       this.refueling = true;
       this.refuelSndCd -= dt;
       if (this.refuelSndCd <= 0) {
@@ -933,6 +1031,7 @@ export class CityRideGame {
         }
       }
     } else {
+      if (this.refueling && stop) this.cb.onRefuelStop(stop);
       this.refueling = false;
       this.refuelStation = null;
       // пока стоим на этой площадке, новую заправку не начинаем; съехали — забываем
@@ -982,6 +1081,7 @@ export class CityRideGame {
     const st = locked[Math.floor(Math.random() * locked.length)];
     st.state = "active";
     st.origin = origin;
+    this.rollStationOffer(st);
     this.stationsActive += 1;
     const cx = st.x + st.w / 2;
     const cy = st.y + st.h / 2;
@@ -1209,6 +1309,7 @@ export class CityRideGame {
     this.drawRoads(vis);
     this.drawStations(vis);
     this.drawSkids(vis);
+    this.drawBase(vis);
     this.drawCanisters(vis);
     this.drawBillboardsLayer(vis);
     this.drawTrees(vis);
@@ -1518,6 +1619,56 @@ export class CityRideGame {
       ctx.textAlign = "left";
       ctx.textBaseline = "alphabetic";
     }
+  }
+
+  /** база нелегальной скупки: огороженный двор с цистернами и ценником */
+  private drawBase(vis: Rect): void {
+    const { ctx } = this;
+    const b = this.city.base;
+    if (!inView(b, vis, 120)) return;
+    const pulse = 0.55 + 0.45 * Math.sin(this.wall * 2.2);
+    ctx.save();
+    // площадка
+    ctx.fillStyle = "#241d33";
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.strokeStyle = rgba(BASE_ACCENT, 0.5);
+    ctx.setLineDash([14, 10]);
+    ctx.lineWidth = 3;
+    ctx.strokeRect(b.x + 3, b.y + 3, b.w - 6, b.h - 6);
+    ctx.setLineDash([]);
+    // цистерны
+    for (let i = 0; i < 3; i++) {
+      const tx = b.x + 34 + i * 52;
+      const ty = b.y + b.h - 58;
+      ctx.fillStyle = "#3c3350";
+      ctx.beginPath();
+      ctx.roundRect(tx, ty, 40, 40, 12);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(10,8,18,0.7)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = rgba(BASE_ACCENT, 0.5);
+      ctx.fillRect(tx + 6, ty + 16, 28, 6);
+    }
+    // будка приёмщика
+    ctx.fillStyle = "#33294a";
+    ctx.beginPath();
+    ctx.roundRect(b.x + b.w - 86, b.y + 22, 62, 54, 8);
+    ctx.fill();
+    ctx.fillStyle = rgba("#ffe9b0", 0.55 * pulse);
+    ctx.fillRect(b.x + b.w - 74, b.y + 36, 38, 18);
+    // вывеска
+    ctx.font = '700 15px Rubik, system-ui, sans-serif';
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = rgba(BASE_ACCENT, 0.85);
+    ctx.fillText("БАЗА · СКУПКА ТОПЛИВА", b.x + b.w / 2, b.y + 24);
+    ctx.font = '700 13px Rubik, system-ui, sans-serif';
+    ctx.fillStyle = `rgba(255,233,176,${0.6 + 0.4 * pulse})`;
+    ctx.fillText(`${CONFIG.fuelSellPrice} ₽ за литр`, b.x + b.w / 2, b.y + 46);
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.restore();
   }
 
   private drawCanisters(vis: Rect): void {
@@ -2050,7 +2201,7 @@ export class CityRideGame {
     const t0 = top;
     const b0 = h - bottom;
 
-    const targets: Array<{ x: number; y: number; accent: string; iconPath: string }> = [];
+    const targets: Array<{ x: number; y: number; accent: string; iconPath: string; note?: string }> = [];
     for (const st of this.city.stations) {
       if (st.state !== "active") continue;
       targets.push({
@@ -2058,8 +2209,16 @@ export class CityRideGame {
         y: st.y + st.h / 2,
         accent: STATION_ACCENT,
         iconPath: FUEL_ICON_PATH,
+        note: `${st.price} ₽`, // цену видно ещё на подъезде
       });
     }
+    // база нелегальной скупки — одна на карту, показываем всегда
+    targets.push({
+      x: this.city.base.x + this.city.base.w / 2,
+      y: this.city.base.y + this.city.base.h / 2,
+      accent: BASE_ACCENT,
+      iconPath: BASE_ICON_PATH,
+    });
     // канистр на карте много — показываем только ближайшие, иначе край экрана
     // превращается в частокол из стрелок
     this.city.canisters
@@ -2080,7 +2239,7 @@ export class CityRideGame {
       alpha: (Math.sin(this.wall * 22) > -0.25 ? 1 : 0.14) * Math.min(1, d.t / 0.4),
     }));
 
-    for (const g of [...targets.map((t) => ({ ...t, alpha: 1 })), ...dead]) {
+    for (const g of [...targets.map((t) => ({ ...t, alpha: 1 })), ...dead.map((d) => ({ ...d, note: undefined }))]) {
       // экранные координаты цели (с учётом тряски камеры — как и весь кадр)
       const sx = w / 2 + shx + (g.x - this.cam.x) * zoom;
       const sy = h / 2 + shy + (g.y - this.cam.y) * zoom;
@@ -2099,7 +2258,8 @@ export class CityRideGame {
 
       const meters = Math.hypot(g.x - this.car.x, g.y - this.car.y) * M_PER_PX;
       const pulse = 0.78 + 0.22 * Math.sin(this.wall * 3 + g.x * 0.01);
-      this.drawPointer(px, py, Math.atan2(dy, dx), fmtDistance(meters), pulse, g.accent, g.iconPath, g.alpha);
+      const label = g.note ? `${fmtDistance(meters)} · ${g.note}` : fmtDistance(meters);
+      this.drawPointer(px, py, Math.atan2(dy, dx), label, pulse, g.accent, g.iconPath, g.alpha);
     }
   }
 

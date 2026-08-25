@@ -41,6 +41,7 @@ export type BotPlan = "station" | "canister";
 type Goal =
   | { kind: "station"; x: number; y: number; st: Station }
   | { kind: "canister"; x: number; y: number; k: Canister }
+  | { kind: "base"; x: number; y: number }
   | { kind: "player"; x: number; y: number }
   | { kind: "wander"; x: number; y: number };
 
@@ -76,6 +77,7 @@ export interface Bot {
 export interface BotStep {
   took: { x: number; y: number } | null; // где подобрал канистру
   refuelAt: Station | null; // на какой АЗС бот только что встал под колонку
+  soldAt: { x: number; y: number } | null; // где сдал канистры на базе
 }
 
 const BOT_R = 15; // радиус кузова
@@ -83,6 +85,8 @@ const LANE_EPS = 60; // насколько близко к оси улицы с�
 const FINAL_DIST = 190; // с этого расстояния к цели едем напрямую
 const DETOUR = 260; // цель считается «по пути», если она не дальше этого от маршрута
 const REFUEL_S = 2.4; // сколько бот стоит под колонкой
+const SELL_S = 2; // сколько бот стоит на базе, пока сливает бензин
+const SELL_FROM = 2; // с этого количества канистр бот едет продавать
 const THINK_S = 0.25; // как часто пересчитывать цель
 const AGGRO_RANGE = 1300; // с какого расстояния бот может решиться на таран
 const AGGRO_CHANCE = 0.14; // вероятность в секунду, пока игрок в радиусе
@@ -152,6 +156,11 @@ function wanderGoal(city: City): Goal {
 function chooseGoal(b: Bot, city: City): Goal {
   const stations = activeStations(city);
   const cans = freeCanisters(city);
+
+  // больше одной полной канистры на борту — везём их на базу нелегальной скупки
+  if (b.taken >= SELL_FROM) {
+    return { kind: "base", x: city.base.x + city.base.w / 2, y: city.base.y + city.base.h / 2 };
+  }
 
   if (b.plan === "station" || b.gotCanister) {
     // основная цель — ближайшая работающая АЗС
@@ -338,7 +347,7 @@ export function createBots(city: City, count: number, start: { x: number; y: num
 }
 
 export function stepBot(b: Bot, city: City, dt: number, player: { x: number; y: number }): BotStep {
-  const step: BotStep = { took: null, refuelAt: null };
+  const step: BotStep = { took: null, refuelAt: null, soldAt: null };
   applyKnock(b, dt);
   if (b.stun > 0) {
     // получил в бок — пару мгновений машину просто несёт
@@ -385,7 +394,18 @@ export function stepBot(b: Bot, city: City, dt: number, player: { x: number; y: 
     step.took = { x: k.x, y: k.y };
   }
 
-  if (g.kind === "station") {
+  if (g.kind === "base") {
+    const bs = city.base;
+    if (b.x > bs.x - 6 && b.x < bs.x + bs.w + 6 && b.y > bs.y - 6 && b.y < bs.y + bs.h + 6) {
+      // сдал канистры — дальше по плану
+      b.wait = SELL_S;
+      b.taken = 0;
+      b.gotCanister = false;
+      b.goal = null;
+      b.think = 0;
+      step.soldAt = { x: b.x, y: b.y };
+    }
+  } else if (g.kind === "station") {
     const s = g.st;
     if (s.state === "active" && b.x > s.x - 6 && b.x < s.x + s.w + 6 && b.y > s.y - 6 && b.y < s.y + s.h + 6) {
       b.wait = REFUEL_S;
