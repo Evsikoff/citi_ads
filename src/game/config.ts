@@ -35,7 +35,7 @@ export const CONFIG = {
   startTankVolume: 50,
 
   /** Сколько рублей у игрока на старте. */
-  startMoney: 3000,
+  startMoney: 10000,
 
   /** По сколько рублей за литр база скупает бензин у игрока. */
   fuelSellPrice: 200,
