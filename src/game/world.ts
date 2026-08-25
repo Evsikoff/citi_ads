@@ -36,7 +36,9 @@ export interface Building extends Rect {
 
 export interface Billboard extends Rect {
   client: Client;
-  discovered: boolean;
+  discovered: boolean; // был ли щит активирован хотя бы раз за заезд (для статистики)
+  state: "ready" | "done";
+  cooldown: number; // секунд до возврата из done в ready
   vertical: boolean;
 }
 
@@ -320,8 +322,8 @@ export function buildCity(clients: Client[], canisterCount = 0, start?: { x: num
     const client = shuffledClients[billboards.length];
     billboards.push(
       cd.vertical
-        ? { x: cd.x, y: cd.y, w: BH, h: BW, client, discovered: false, vertical: true }
-        : { x: cd.x, y: cd.y, w: BW, h: BH, client, discovered: false, vertical: false }
+        ? { x: cd.x, y: cd.y, w: BH, h: BW, client, discovered: false, state: "ready", cooldown: 0, vertical: true }
+        : { x: cd.x, y: cd.y, w: BW, h: BH, client, discovered: false, state: "ready", cooldown: 0, vertical: false }
     );
   }
 

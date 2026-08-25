@@ -52,6 +52,8 @@ export interface Bot {
   speed: number;
   color: string;
   name: string;
+  /** сколько литров конкурент залил за текущий заезд */
+  filledLiters: number;
   plan: BotPlan;
   goal: Goal | null;
   gotCanister: boolean; // пункт «взять канистру» выполнен
@@ -321,6 +323,7 @@ export function createBots(city: City, count: number, start: { x: number; y: num
       speed: 0,
       color: BOT_COLORS[i % BOT_COLORS.length],
       name: BOT_NAMES[i % BOT_NAMES.length],
+      filledLiters: 0,
       plan: "station",
       goal: null,
       gotCanister: false,

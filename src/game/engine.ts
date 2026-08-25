@@ -28,12 +28,21 @@ export interface HudData {
   refuelLeft: number | null;
 }
 
+export interface LeaderboardEntry {
+  position: number;
+  name: string;
+  liters: number;
+  isPlayer: boolean;
+  color: string;
+}
+
 export interface GameCallbacks {
   onHud(h: HudData): void;
+  onLeaderboard(entries: LeaderboardEntry[]): void;
   onDiscover(client: Client, index: number): void;
   onWin(stats: { time: number; top: number }): void;
   onGameOver(stats: { time: number; found: number }): void;
-  onBumpKnown(): void;
+  onBillboardUnavailable(): void;
   onStationUnlock(active: number, total: number, origin: "timer" | "ad"): void;
   onStationLock(active: number, total: number): void;
   onCanister(count: number, liters: number): void;
@@ -68,7 +77,7 @@ interface Skid {
 }
 
 const REV_MAX = 215;
-const MM = 216;
+const MM = 640;
 const BOTS = 10; // ботов-конкурентов в заезде
 const PLAYERS = 1 + BOTS; // участников заезда: игрок и боты
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
@@ -80,6 +89,16 @@ const M_PER_PX = 0.35; // метров в мировом пикселе — дл
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
 const PLAYER_COLOR = "#e5472f"; // машина игрока — единственная красная
+
+const PLAYER_ADJECTIVES = ["Ночной", "Красный", "Быстрый", "Дерзкий", "Точный", "Шустрый"];
+const PLAYER_NOUNS = ["Курьер", "Пилот", "Лис", "Филин", "Раллист", "Навигатор"];
+
+function makePlayerName(): string {
+  const adjective = PLAYER_ADJECTIVES[Math.floor(Math.random() * PLAYER_ADJECTIVES.length)];
+  const noun = PLAYER_NOUNS[Math.floor(Math.random() * PLAYER_NOUNS.length)];
+  const number = 10 + Math.floor(Math.random() * 90);
+  return `${adjective}_${noun}${number}`;
+}
 
 // точка старта: средняя вертикальная улица, чуть ниже центра города
 const START = { x: ROAD / 2 + Math.floor(GRID / 2) * (BLOCK + ROAD), y: WORLD * 0.62 };
@@ -137,8 +156,8 @@ const DEAD_ACCENT = "#ff5340"; // сколько ближайших канист
 const STATION_ACCENT = "#7ee08a";
 const CANISTER_ACCENT = "#58c9f3";
 const BASE_ACCENT = "#b98cff";
-// иконка базы — пачка купюр
-const BASE_ICON_PATH = "M3 7h18v10H3V7zm4 0v10M17 7v10M12 9.5a2.5 2.5 0 000 5 2.5 2.5 0 000-5z";
+// иконка базы у крайнего указателя — знак рубля
+const BASE_ICON_PATH = "M8 4h5.5C16 4 18 5.7 18 8s-2 4-4.5 4H8M8 8h6M7 15h10M7 18h8M10 12v9";
 
 export class CityRideGame {
   private cv: HTMLCanvasElement;
@@ -178,6 +197,10 @@ export class CityRideGame {
   private money = CONFIG.startMoney; // рублей на счету
   private sessionLiters = 0; // сколько литров налили на этой колонке
   private sessionSpent = 0; // и сколько рублей за них отдали
+  private totalLitersFilled = 0; // рейтинг: все литры, залитые игроком за текущий заезд
+  private playerName = makePlayerName();
+  private leaderboardCd = 0;
+  private leaderboardDirty = true;
   private atBase = false; // стоим на площадке базы — второй раз не предлагаем
   private refueling = false;
   private stalled = false;
@@ -201,7 +224,7 @@ export class CityRideGame {
   private prevWheelR: { x: number; y: number } | null = null;
 
   private bumpCd = 0;
-  private knownCd = 0;
+  private billboardContact: Billboard | null = null;
   private leafCd = 0;
 
   private onKeyDown: (e: KeyboardEvent) => void;
@@ -218,13 +241,17 @@ export class CityRideGame {
     this.cv = canvas;
     this.ctx = canvas.getContext("2d")!;
     this.mini = minimap;
-    if (minimap) this.mctx = minimap.getContext("2d");
+    if (minimap) {
+      minimap.width = minimap.height = MM;
+      this.mctx = minimap.getContext("2d");
+    }
     this.city = buildCity(clients, CANISTERS_ON_MAP, { x: START.x, y: START.y });
     this.total = new Set(this.city.billboards.map((b) => b.client.id)).size;
     this.cb = cb;
     this.placeCar();
     this.initStations();
     this.bots = createBots(this.city, BOTS, START);
+    this.emitLeaderboard();
 
     this.mmBase = document.createElement("canvas");
     this.mmBase.width = this.mmBase.height = MM;
@@ -255,6 +282,7 @@ export class CityRideGame {
     this.resetFuel();
     this.gameOverSent = false;
     this.initStations();
+    this.emitLeaderboard();
     sfx.engineStart();
   }
 
@@ -269,7 +297,11 @@ export class CityRideGame {
   }
 
   reset(): void {
-    for (const b of this.city.billboards) b.discovered = false;
+    for (const b of this.city.billboards) {
+      b.discovered = false;
+      b.state = "ready";
+      b.cooldown = 0;
+    }
     this.found = 0;
     this.won = false;
     this.time = 0;
@@ -280,6 +312,7 @@ export class CityRideGame {
     this.skids = [];
     this.placeCar();
     this.initStations();
+    this.emitLeaderboard();
   }
 
   destroy(): void {
@@ -299,6 +332,10 @@ export class CityRideGame {
     this.money = CONFIG.startMoney;
     this.sessionLiters = 0;
     this.sessionSpent = 0;
+    this.totalLitersFilled = 0;
+    this.playerName = makePlayerName();
+    this.leaderboardCd = 0;
+    this.leaderboardDirty = true;
     this.atBase = false;
     this.canisters = 0;
     this.stalled = false;
@@ -309,6 +346,7 @@ export class CityRideGame {
     this.knock.x = 0;
     this.knock.y = 0;
     this.deadPointers = [];
+    this.billboardContact = null;
     for (const k of this.city.canisters) {
       k.taken = false;
       k.cool = 0;
@@ -410,16 +448,31 @@ export class CityRideGame {
     const dt = clamp((ts - this.last) / 1000 || 0.016, 0.001, 0.033);
     this.last = ts;
     this.wall += dt;
-    if (this.phase === "play" && !this.paused) this.update(dt);
+    if (this.phase === "play") {
+      // Таймауты билбордов идут по реальному времени, в том числе пока открыто
+      // окно клиента или карта и основная симуляция поставлена на паузу.
+      this.updateBillboards(dt);
+      if (!this.paused) this.update(dt);
+    }
     this.render(dt);
   };
 
   /* ---------------- simulation ---------------- */
 
+  private updateBillboards(dt: number): void {
+    for (const billboard of this.city.billboards) {
+      if (billboard.state !== "done") continue;
+      billboard.cooldown = Math.max(0, billboard.cooldown - dt);
+      if (billboard.cooldown <= 0) {
+        billboard.state = "ready";
+      }
+    }
+  }
+
   private update(dt: number): void {
     this.time += dt;
+    this.leaderboardCd -= dt;
     this.bumpCd -= dt;
-    this.knownCd -= dt;
     this.leafCd -= dt;
     this.crashCd -= dt;
 
@@ -438,6 +491,7 @@ export class CityRideGame {
       this.updateParticles(dt);
       this.fadeSkids(dt);
       sfx.engineIdle();
+      this.maybeEmitLeaderboard();
       this.emitHud();
       return;
     }
@@ -545,7 +599,38 @@ export class CityRideGame {
 
     if (this.stalled) sfx.engineIdle();
     else sfx.engine(sp / MAX_SPEED, throttle);
+    this.maybeEmitLeaderboard();
     this.emitHud();
+  }
+
+  private maybeEmitLeaderboard(): void {
+    if (!this.leaderboardDirty || this.leaderboardCd > 0) return;
+    this.emitLeaderboard();
+    this.leaderboardCd = 0.2;
+  }
+
+  private emitLeaderboard(): void {
+    const rows = [
+      {
+        name: this.playerName,
+        liters: this.totalLitersFilled,
+        isPlayer: true,
+        color: PLAYER_COLOR,
+        order: 0,
+      },
+      ...this.bots.map((b, index) => ({
+        name: b.name,
+        liters: b.filledLiters,
+        isPlayer: false,
+        color: b.color,
+        order: index + 1,
+      })),
+    ]
+      .sort((a, b) => b.liters - a.liters || a.order - b.order)
+      .map(({ order: _order, ...row }, index) => ({ ...row, position: index + 1 }));
+
+    this.leaderboardDirty = false;
+    this.cb.onLeaderboard(rows);
   }
 
   private emitHud(): void {
@@ -597,7 +682,9 @@ export class CityRideGame {
 
   /** продать литры базе: возвращает, сколько рублей выручили */
   sellFuel(liters: number): number {
-    const sold = clamp(liters, 0, this.fuel);
+    // Приёмщик никогда не оставляет игрока без большей части запаса:
+    // за один визит можно слить не более половины текущего топлива.
+    const sold = clamp(liters, 0, this.fuel / 2);
     if (sold <= 0) return 0;
     this.fuel -= sold;
     const paid = Math.round(sold * CONFIG.fuelSellPrice);
@@ -883,7 +970,14 @@ export class CityRideGame {
           this.spawn(step.soldAt.x, step.soldAt.y, "confetti", i % 2 ? "#ffd27a" : BASE_ACCENT, 0.8, 200);
         }
       }
-      if (step.refuelAt) this.takeStation(step.refuelAt, b.taken, false);
+      if (step.refuelAt) {
+        // Боты не ведут полноценную модель бака, поэтому фактический объём их
+        // заправки считаем по вместимости и реальному лимиту выбранной колонки.
+        const requested = 18 + b.taken * CANISTER_L;
+        b.filledLiters += Math.min(requested, step.refuelAt.limit ?? requested);
+        this.leaderboardDirty = true;
+        this.takeStation(step.refuelAt, b.taken, false);
+      }
     }
   }
 
@@ -1013,7 +1107,10 @@ export class CityRideGame {
       this.fuel = Math.min(this.fuelMax, this.fuel + step);
       const paid = (this.fuel - was) * at.price;
       this.money = Math.max(0, this.money - paid);
-      this.sessionLiters += this.fuel - was;
+      const filled = this.fuel - was;
+      this.sessionLiters += filled;
+      this.totalLitersFilled += filled;
+      if (filled > 0) this.leaderboardDirty = true;
       this.sessionSpent += paid;
       this.refueling = true;
       this.refuelSndCd -= dt;
@@ -1106,19 +1203,23 @@ export class CityRideGame {
   private collide(): void {
     const c = this.car;
     let hit = false;
+    let billboardContact: Billboard | null = null;
 
     for (const b of this.city.buildings) {
       if (this.resolveRect(b)) hit = true;
     }
     for (const b of this.city.billboards) {
       if (this.resolveRect(b)) {
-        if (!b.discovered) this.discover(b);
-        else if (this.knownCd <= 0) {
-          this.knownCd = 1.4;
-          this.cb.onBumpKnown();
+        billboardContact = b;
+        // Повторное взаимодействие возможно, но только после того, как игрок
+        // отъехал от щита и снова в него въехал.
+        if (this.billboardContact !== b && b.state === "ready") {
+          if (this.hasInactiveStations()) this.discover(b);
+          else this.cb.onBillboardUnavailable();
         }
       }
     }
+    this.billboardContact = billboardContact;
     // деревья (мягко, по «стволу»)
     for (const t of this.city.trees) {
       const dx = c.x - t.x;
@@ -1201,9 +1302,11 @@ export class CityRideGame {
   }
 
   private discover(b: Billboard): void {
-    // клиент подписан — остальные его щиты по городу тоже считаются отработанными
-    for (const o of this.city.billboards) if (o.client.id === b.client.id) o.discovered = true;
-    this.found += 1;
+    const firstVisit = !b.discovered;
+    b.discovered = true;
+    b.state = "done";
+    b.cooldown = CONFIG.billboardTimeout;
+    if (firstVisit) this.found += 1;
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2 - 20;
     const colors = [b.client.color, "#fdf3e0", "#ffd27a", shade(b.client.color, 0.75)];
@@ -1212,8 +1315,8 @@ export class CityRideGame {
     }
     sfx.chime();
     this.unlockRandom("ad"); // просмотр рекламы активирует ещё одну АЗС
-    this.cb.onDiscover(b.client, this.found);
-    if (this.found >= this.total && !this.won) {
+    this.cb.onDiscover(b.client, this.city.billboards.indexOf(b) + 1);
+    if (firstVisit && this.found >= this.total && !this.won) {
       this.won = true;
       sfx.win();
       this.cb.onWin({ time: this.time, top: Math.round(this.topSpeed * KMH) });
@@ -1318,6 +1421,7 @@ export class CityRideGame {
     this.drawParticles("smoke");
     this.drawBots(vis);
     this.drawCar();
+    this.drawPlayerNick();
     this.drawParticles("solid");
     this.drawRefuelInfo(vis);
     this.lightPass(vis);
@@ -1616,9 +1720,47 @@ export class CityRideGame {
         ctx.arc(bx + bw / 2, by + bh - 12, 3.4, 0, Math.PI * 2);
         ctx.fill();
       }
+      if (active) this.drawStationOffer(s);
       ctx.textAlign = "left";
       ctx.textBaseline = "alphabetic";
     }
+  }
+
+  private hasInactiveStations(): boolean {
+    return this.city.stations.some((station) => station.state !== "active");
+  }
+
+  /** Ценник действующей АЗС: цена и условия отпуска видны прямо на карте. */
+  private drawStationOffer(s: Station): void {
+    const { ctx } = this;
+    const priceText = `${s.price} ₽/л`;
+    const limitText = s.limit === null ? "без ограничения" : `лимит ${s.limit} л`;
+    const x = s.x + s.w / 2;
+    const y = s.y - 20;
+
+    ctx.save();
+    ctx.font = '700 13px Rubik, system-ui, sans-serif';
+    const width = Math.max(ctx.measureText(priceText).width, ctx.measureText(limitText).width) + 34;
+    const height = 42;
+    ctx.beginPath();
+    ctx.roundRect(x - width / 2, y - height / 2, width, height, 8);
+    ctx.fillStyle = "rgba(8,14,20,0.9)";
+    ctx.fill();
+    ctx.strokeStyle = rgba(STATION_ACCENT, 0.62);
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    ctx.fillStyle = STATION_ACCENT;
+    ctx.beginPath();
+    ctx.arc(x - width / 2 + 12, y - 8, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#f5d98e";
+    ctx.fillText(priceText, x - width / 2 + 22, y - 8);
+    ctx.font = '600 11px Rubik, system-ui, sans-serif';
+    ctx.fillStyle = s.limit === null ? "#a9eab3" : "#ffae79";
+    ctx.fillText(limitText, x - width / 2 + 12, y + 9);
+    ctx.restore();
   }
 
   /** база нелегальной скупки: огороженный двор с цистернами и ценником */
@@ -1757,6 +1899,7 @@ export class CityRideGame {
 
   private drawBillboardsLayer(vis: Rect): void {
     const { ctx } = this;
+    const available = this.hasInactiveStations();
     this.city.billboards.forEach((b, idx) => {
       if (!inView(b, vis, 80)) return;
       const cx = b.x + b.w / 2;
@@ -1778,22 +1921,16 @@ export class CityRideGame {
 
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      if (!b.discovered) {
-        ctx.fillStyle = "#141a26";
+      if (b.state === "ready") {
+        ctx.fillStyle = available ? "#141a26" : "#20242c";
         ctx.fillRect(px, py, b.w, b.h);
-        const pulse = 0.5 + 0.5 * Math.sin(this.wall * 3 + idx * 1.7);
-        ctx.strokeStyle = `rgba(255,183,84,${0.3 + 0.5 * pulse})`;
-        ctx.lineWidth = 2.5;
-        ctx.setLineDash([10, 7]);
-        ctx.strokeRect(px + 5, py + 5, b.w - 10, b.h - 10);
-        ctx.setLineDash([]);
-        ctx.fillStyle = "#ffcf7d";
+        ctx.fillStyle = available ? "#ffcf7d" : "#737b89";
         ctx.font = `${b.vertical ? 13 : 17}px "Russo One"`;
-        ctx.fillText("СВОБОДНО", cx, py + b.h / 2 - (b.vertical ? 4 : 9));
+        ctx.fillText(available ? "ДОСТУПНО" : "НЕТ ЦЕЛЕЙ", cx, py + b.h / 2 - (b.vertical ? 4 : 9));
         if (!b.vertical) {
-          ctx.fillStyle = "rgba(255,207,125,0.6)";
+          ctx.fillStyle = available ? "rgba(255,207,125,0.6)" : "rgba(150,158,172,0.55)";
           ctx.font = "500 11px Rubik";
-          ctx.fillText("место для вашей рекламы", cx, py + b.h / 2 + 13);
+          ctx.fillText(available ? "откроет новую АЗС" : "все АЗС уже работают", cx, py + b.h / 2 + 13);
         }
       } else {
         const cl = b.client;
@@ -1815,7 +1952,7 @@ export class CityRideGame {
         ctx.font = "600 11px Rubik";
         ctx.fillText(cl.name, cx, py + b.h - 10);
         ctx.restore();
-        // зелёная отметка «подписано»
+        // зелёная отметка завершённого взаимодействия
         ctx.fillStyle = "#3ddc84";
         ctx.beginPath();
         ctx.arc(px + b.w - 1, py + 1, 10, 0, Math.PI * 2);
@@ -1827,7 +1964,37 @@ export class CityRideGame {
         ctx.lineTo(px + b.w - 2, py + 5);
         ctx.lineTo(px + b.w + 4, py - 3);
         ctx.stroke();
+
+        // Состояние done остаётся на щите до окончания настраиваемого таймаута.
+        const seconds = Math.max(1, Math.ceil(b.cooldown));
+        const chipW = Math.min(b.w - 14, 104);
+        const chipH = 38;
+        const chipY = py + b.h / 2 - chipH / 2;
+        ctx.fillStyle = "rgba(7,10,17,0.84)";
+        ctx.beginPath();
+        ctx.roundRect(cx - chipW / 2, chipY, chipW, chipH, 7);
+        ctx.fill();
+        ctx.strokeStyle = "rgba(126,224,138,0.72)";
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+        ctx.fillStyle = "#7ee08a";
+        ctx.font = `700 ${b.vertical ? 9 : 10}px Rubik`;
+        ctx.fillText("DONE", cx, chipY + 11);
+        ctx.fillStyle = "#f2ecdf";
+        ctx.font = `700 ${b.vertical ? 13 : 15}px "Russo One"`;
+        ctx.fillText(`${seconds} С`, cx, chipY + 27);
       }
+      const pulse = 0.5 + 0.5 * Math.sin(this.wall * 3 + idx * 1.7);
+      const ready = b.state === "ready" && available;
+      ctx.strokeStyle = ready
+        ? `rgba(255,183,84,${0.3 + 0.55 * pulse})`
+        : b.state === "done"
+          ? "rgba(126,224,138,0.58)"
+          : "rgba(110,118,132,0.35)";
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash(ready ? [10, 7] : [5, 9]);
+      ctx.strokeRect(px + 5, py + 5, b.w - 10, b.h - 10);
+      ctx.setLineDash([]);
     });
   }
 
@@ -1996,6 +2163,26 @@ export class CityRideGame {
     ctx.restore();
   }
 
+  private drawPlayerNick(): void {
+    const { ctx } = this;
+    ctx.save();
+    ctx.font = '700 11px Rubik, system-ui, sans-serif';
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const w = ctx.measureText(this.playerName).width + 12;
+    const y = this.car.y - 30;
+    ctx.fillStyle = "rgba(8,12,20,0.82)";
+    ctx.beginPath();
+    ctx.roundRect(this.car.x - w / 2, y - 8, w, 16, 5);
+    ctx.fill();
+    ctx.strokeStyle = rgba(PLAYER_COLOR, 0.7);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = "#ffb7a8";
+    ctx.fillText(this.playerName, this.car.x, y + 0.5);
+    ctx.restore();
+  }
+
   /** сколько секунд осталось до открытия следующей АЗС из-за этой колонки */
   private unlockLeft(st: Station): number | null {
     const q = this.unlockQueue.find((e) => e.from === st);
@@ -2122,11 +2309,12 @@ export class CityRideGame {
     }
 
     // свечение билбордов
+    const billboardsAvailable = this.hasInactiveStations();
     this.city.billboards.forEach((b, idx) => {
       if (!inView(b, vis, 160)) return;
       const cx = b.x + b.w / 2;
       const cy = b.y + b.h / 2 - 22;
-      if (!b.discovered) {
+      if (b.state === "ready" && billboardsAvailable) {
         const pulse = 0.5 + 0.5 * Math.sin(this.wall * 3 + idx * 1.7);
         const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, 130);
         g.addColorStop(0, `rgba(255,183,84,${0.05 + 0.1 * pulse})`);
@@ -2209,7 +2397,7 @@ export class CityRideGame {
         y: st.y + st.h / 2,
         accent: STATION_ACCENT,
         iconPath: FUEL_ICON_PATH,
-        note: `${st.price} ₽`, // цену видно ещё на подъезде
+        note: `${st.price} ₽/л · ${st.limit === null ? "без лимита" : `лимит ${st.limit} л`}`,
       });
     }
     // база нелегальной скупки — одна на карту, показываем всегда
@@ -2367,87 +2555,106 @@ export class CityRideGame {
     if (!this.mctx || !this.mini) return;
     const m = this.mctx;
     const s = MM / WORLD;
+    const u = MM / 216;
+    m.setTransform(1, 0, 0, 1, 0, 0);
     m.clearRect(0, 0, MM, MM);
     m.drawImage(this.mmBase, 0, 0);
-    // АЗС: активные — пульсирующий оранжевый, «пустые» — серые с красной точкой
-    const carMX = this.car.x * s;
-    const carMY = this.car.y * s;
+
+    // Видимая сейчас область города — помогает сопоставить карту с игровым экраном.
+    const viewW = (this.vw / this.cam.zoom) * s;
+    const viewH = (this.vh / this.cam.zoom) * s;
+    m.strokeStyle = "rgba(236,243,255,0.28)";
+    m.lineWidth = Math.max(1, 0.7 * u);
+    m.setLineDash([3 * u, 3 * u]);
+    m.strokeRect(this.cam.x * s - viewW / 2, this.cam.y * s - viewH / 2, viewW, viewH);
+    m.setLineDash([]);
+
+    // АЗС: активные — зелёные, закрытые — серые с мерцающей красной точкой.
     for (const st of this.city.stations) {
-      const sx = st.x * s - 1;
-      const sy = st.y * s - 1;
-      const sw = st.w * s + 2;
-      const sh = st.h * s + 2;
-      const mx = sx + sw / 2;
-      const my = sy + sh / 2;
+      const pad = 0.8 * u;
+      const sx = st.x * s - pad;
+      const sy = st.y * s - pad;
+      const sw = st.w * s + pad * 2;
+      const sh = st.h * s + pad * 2;
       if (st.state === "active") {
-        const pulse = 0.55 + 0.45 * Math.sin(this.wall * 3 + st.x * 0.01);
-        m.fillStyle = "#f2a93b";
+        m.fillStyle = "#7ee08a";
         m.fillRect(sx, sy, sw, sh);
-        m.strokeStyle = `rgba(255,224,160,${pulse * 0.9})`;
-        m.lineWidth = 1;
-        m.strokeRect(sx - 2, sy - 2, sw + 4, sh + 4);
-        // стрелка от машины к станции + дистанция
-        const dx = mx - carMX;
-        const dy = my - carMY;
-        const dpx = Math.hypot(dx, dy);
-        if (dpx > 22) {
-          const ux = dx / dpx;
-          const uy = dy / dpx;
-          const x1 = carMX + ux * 9;
-          const y1 = carMY + uy * 9;
-          const x2 = mx - ux * 9;
-          const y2 = my - uy * 9;
-          m.strokeStyle = "rgba(242,169,59,0.85)";
-          m.lineWidth = 1.6;
-          m.beginPath();
-          m.moveTo(x1, y1);
-          m.lineTo(x2, y2);
-          m.stroke();
-          const ang = Math.atan2(y2 - y1, x2 - x1);
-          m.fillStyle = "rgba(255,209,122,0.95)";
-          m.beginPath();
-          m.moveTo(x2 + Math.cos(ang) * 4.6, y2 + Math.sin(ang) * 4.6);
-          m.lineTo(x2 + Math.cos(ang + 2.5) * 4.4, y2 + Math.sin(ang + 2.5) * 4.4);
-          m.lineTo(x2 + Math.cos(ang - 2.5) * 4.4, y2 + Math.sin(ang - 2.5) * 4.4);
-          m.closePath();
-          m.fill();
-          // подпись с дистанцией
-          const label = fmtDistance((dpx / s) * M_PER_PX);
-          const lx = (x1 + x2) / 2;
-          const ly = (y1 + y2) / 2;
-          m.font = "700 9px Rubik";
-          m.textAlign = "center";
-          m.textBaseline = "middle";
-          const tw = m.measureText(label).width;
-          m.fillStyle = "rgba(8,12,22,0.85)";
-          m.fillRect(lx - tw / 2 - 3, ly - 6.5, tw + 6, 13);
-          m.fillStyle = "#ffd9a0";
-          m.fillText(label, lx, ly + 0.5);
-          m.textAlign = "left";
-          m.textBaseline = "alphabetic";
-        }
+        m.strokeStyle = "rgba(214,255,220,0.88)";
+        m.lineWidth = 0.8 * u;
+        m.strokeRect(sx - 1.5 * u, sy - 1.5 * u, sw + 3 * u, sh + 3 * u);
       } else {
         m.fillStyle = "#333b49";
         m.fillRect(sx, sy, sw, sh);
-        m.fillStyle = "#a34a3e";
-        m.fillRect(sx + sw / 2 - 1, sy + sh / 2 - 1, 2, 2);
+        const blink = 0.25 + 0.75 * (0.5 + 0.5 * Math.sin(this.wall * 5 + st.x * 0.01));
+        m.fillStyle = `rgba(217,93,77,${blink})`;
+        m.beginPath();
+        m.arc(sx + sw / 2, sy + sh / 2, (1.1 + blink * 0.7) * u, 0, Math.PI * 2);
+        m.fill();
       }
     }
-    this.city.billboards.forEach((b, i) => {
+
+    // База скупки топлива.
+    const base = this.city.base;
+    const baseX = base.x * s;
+    const baseY = base.y * s;
+    const baseW = base.w * s;
+    const baseH = base.h * s;
+    const baseCX = baseX + baseW / 2;
+    const baseCY = baseY + baseH / 2;
+    m.fillStyle = "#4b356b";
+    m.fillRect(baseX, baseY, baseW, baseH);
+    m.strokeStyle = "#b98cff";
+    m.lineWidth = 0.9 * u;
+    m.strokeRect(baseX - u, baseY - u, baseW + 2 * u, baseH + 2 * u);
+    m.fillStyle = "#b98cff";
+    m.beginPath();
+    m.arc(baseCX, baseCY, 5.4 * u, 0, Math.PI * 2);
+    m.fill();
+    m.fillStyle = "#120c20";
+    m.font = `700 ${7 * u}px Rubik, sans-serif`;
+    m.textAlign = "center";
+    m.textBaseline = "middle";
+    m.fillText("₽", baseCX, baseCY + 0.3 * u);
+
+    // Билборды: статичные янтарные или серые метки без мерцания.
+    const billboardsAvailable = this.hasInactiveStations();
+    this.city.billboards.forEach((b) => {
       const bx = (b.x + b.w / 2) * s;
       const by = (b.y + b.h / 2) * s;
-      if (b.discovered) {
+      if (b.state !== "ready" || !billboardsAvailable) {
         m.fillStyle = "#5d6880";
-        m.fillRect(bx - 2, by - 2, 4, 4);
+        m.fillRect(bx - 2.1 * u, by - 2.1 * u, 4.2 * u, 4.2 * u);
       } else {
-        const pulse = 0.55 + 0.45 * Math.sin(this.wall * 3 + i * 1.7);
-        m.fillStyle = `rgba(255,183,84,${pulse})`;
+        m.fillStyle = "#ffb754";
         m.beginPath();
-        m.arc(bx, by, 3.4, 0, Math.PI * 2);
+        m.arc(bx, by, 3.1 * u, 0, Math.PI * 2);
         m.fill();
       }
     });
-    // машина
+
+    // Канистры, которые ещё лежат на карте.
+    for (const canister of this.city.canisters) {
+      if (canister.taken) continue;
+      const kx = canister.x * s;
+      const ky = canister.y * s;
+      const size = 2.6 * u;
+      m.save();
+      m.translate(kx, ky);
+      m.rotate(Math.PI / 4);
+      m.fillStyle = "#58c9f3";
+      m.fillRect(-size, -size, size * 2, size * 2);
+      m.restore();
+    }
+
+    // Конкуренты — маленькие точки их фирменных цветов.
+    for (const bot of this.bots) {
+      m.fillStyle = bot.color;
+      m.beginPath();
+      m.arc(bot.x * s, bot.y * s, 1.7 * u, 0, Math.PI * 2);
+      m.fill();
+    }
+
+    // Машина игрока — крупная направленная метка с белой обводкой.
     const cx = this.car.x * s;
     const cy = this.car.y * s;
     m.save();
@@ -2455,16 +2662,22 @@ export class CityRideGame {
     m.rotate(this.car.angle);
     m.fillStyle = "rgba(255,120,90,0.35)";
     m.beginPath();
-    m.arc(0, 0, 7, 0, Math.PI * 2);
+    m.arc(0, 0, 7 * u, 0, Math.PI * 2);
     m.fill();
-    m.fillStyle = "#fdf3e3";
+    m.fillStyle = "#e5472f";
     m.beginPath();
-    m.moveTo(6.5, 0);
-    m.lineTo(-4.5, 4.5);
-    m.lineTo(-4.5, -4.5);
+    m.moveTo(6.5 * u, 0);
+    m.lineTo(-4.5 * u, 4.5 * u);
+    m.lineTo(-4.5 * u, -4.5 * u);
     m.closePath();
     m.fill();
+    m.strokeStyle = "#fff4e8";
+    m.lineWidth = 1.1 * u;
+    m.stroke();
     m.restore();
+
+    m.textAlign = "left";
+    m.textBaseline = "alphabetic";
   }
 }
 

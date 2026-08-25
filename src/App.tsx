@@ -3,12 +3,14 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { CLIENTS } from "./game/clients";
 import type { Client } from "./game/clients";
 import { CityRideGame } from "./game/engine";
-import type { HudData } from "./game/engine";
+import type { HudData, LeaderboardEntry } from "./game/engine";
 import { sfx } from "./game/audio";
 import { CONFIG } from "./game/config";
 import { ClientModal } from "./components/ClientModal";
 
 const fmtMoney = (v: number) => Math.round(v).toLocaleString("ru-RU");
+const floorTenth = (v: number) => Math.floor(v * 10) / 10;
+const SELL_PERCENTAGES = [12.5, 25, 37.5, 50] as const;
 
 const fmt = (t: number) => {
   const m = Math.floor(t / 60);
@@ -74,6 +76,18 @@ const TrophyIcon = () => (
     />
   </svg>
 );
+const MapIcon = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className ?? "w-5 h-5"}>
+    <path
+      d="M3.5 5.5l5-2 7 2 5-2v15l-5 2-7-2-5 2v-15zM8.5 3.5v15M15.5 5.5v15"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <circle cx="12" cy="11" r="2.2" fill="currentColor" />
+  </svg>
+);
 
 const GAUGE_TICKS = [0, 0.25, 0.5, 0.75, 1].map((f) => {
   const a = ((135 + 270 * f) * Math.PI) / 180;
@@ -93,7 +107,6 @@ export default function App() {
   const fuelIconRef = useRef<HTMLSpanElement>(null);
   const refuelRef = useRef<HTMLSpanElement>(null);
   const lowRef = useRef<HTMLSpanElement>(null);
-  const stationsCountRef = useRef<HTMLSpanElement>(null);
   const refuelPanelRef = useRef<HTMLDivElement>(null);
   const refuelLitersRef = useRef<HTMLSpanElement>(null);
   const canisterCountRef = useRef<HTMLSpanElement>(null);
@@ -106,13 +119,14 @@ export default function App() {
 
   const [phase, setPhase] = useState<"menu" | "play">("menu");
   const [modal, setModal] = useState<{ client: Client; index: number } | null>(null);
-  const [foundIds, setFoundIds] = useState<string[]>([]);
   const [muted, setMuted] = useState(false);
   const [win, setWin] = useState<{ time: number; top: number } | null>(null);
   const [gameover, setGameover] = useState<{ time: number; found: number } | null>(null);
   const [toast, setToast] = useState<{ id: number; msg: string } | null>(null);
   const [sell, setSell] = useState<{ fuel: number; price: number } | null>(null);
   const [sellLiters, setSellLiters] = useState(0);
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [mapOpen, setMapOpen] = useState(false);
   const [touch] = useState(
     () => typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches
   );
@@ -159,25 +173,22 @@ export default function App() {
           if (refuelPriceRef.current) refuelPriceRef.current.textContent = `${h.refuelPrice} ₽/л · отдано ${fmtMoney(h.refuelSpent)} ₽`;
           if (refuelLimitRef.current) {
             refuelLimitRef.current.textContent =
-              h.refuelLeft === null ? "" : `лимит колонки: ещё ${h.refuelLeft.toFixed(1)} л`;
+              h.refuelLeft === null
+                ? "без ограничения на отпуск"
+                : `лимит колонки: ещё ${h.refuelLeft.toFixed(1)} л`;
           }
         }
         if (canisterHudCountRef.current) canisterHudCountRef.current.textContent = String(h.canisters);
         if (canisterHudRef.current) canisterHudRef.current.style.opacity = h.canisters ? "1" : "0.45";
         if (lowRef.current) lowRef.current.style.display = !h.refueling && fr < 0.22 && f > 0 ? "inline" : "none";
-        if (stationsCountRef.current) {
-          const full = h.stationsActive >= h.stationsTotal;
-          stationsCountRef.current.textContent = `${h.stationsActive}/${h.stationsTotal}`;
-          stationsCountRef.current.style.color = full ? "#7ee08a" : "#f2a93b";
-        }
       },
+      onLeaderboard: setLeaderboard,
       onDiscover: (client, index) => {
-        setFoundIds((prev) => (prev.includes(client.id) ? prev : [...prev, client.id]));
         setModal({ client, index });
       },
       onWin: (stats) => setWin(stats),
       onGameOver: (stats) => setGameover(stats),
-      onBumpKnown: () => showToast("Этот клиент уже подписан — ищи свободный щит"),
+      onBillboardUnavailable: () => showToast("Все АЗС уже работают — билборды пока недоступны"),
       onStationUnlock: (active, total, origin) =>
         showToast(
           origin === "ad"
@@ -196,7 +207,7 @@ export default function App() {
         ),
       onBase: (fuel, price) => {
         setSell({ fuel, price });
-        setSellLiters(Math.floor(fuel));
+        setSellLiters(floorTenth(fuel / 2));
       },
       onCanisterLost: (count, left) =>
         showToast(
@@ -221,17 +232,18 @@ export default function App() {
     sfx.init();
     sfx.tick();
     gameRef.current?.begin();
+    setMapOpen(false);
     setPhase("play");
   };
 
   const restart = () => {
     sfx.tick();
     gameRef.current?.reset();
-    setFoundIds([]);
     setWin(null);
     setModal(null);
     setGameover(null);
-    showToast("Новая смена: все билборды снова свободны, бак полный");
+    setMapOpen(false);
+    showToast("Новая охота: билборды снова доступны, бак полный");
   };
 
   const toggleMute = () => {
@@ -252,16 +264,21 @@ export default function App() {
           restart();
         }
       }
-      if (e.code === "KeyM") toggleMute();
+      if (e.code === "KeyM" && phase === "play" && !modal && !sell && !win && !gameover) {
+        e.preventDefault();
+        setMapOpen((open) => !open);
+      }
+      if (e.code === "KeyV") toggleMute();
       if (e.code === "Escape") {
-        if (modal) setModal(null);
+        if (mapOpen) setMapOpen(false);
+        else if (modal) setModal(null);
         else if (win) setWin(null);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, modal, win, gameover]);
+  }, [phase, modal, sell, win, gameover, mapOpen]);
 
   const hold = (k: "up" | "down" | "left" | "right") => ({
     onPointerDown: (e: ReactPointerEvent) => {
@@ -273,27 +290,115 @@ export default function App() {
     onPointerCancel: () => gameRef.current?.setKey(k, false),
   });
 
-  const found = foundIds.length;
+  const playerLeaderboardIndex = leaderboard.findIndex((entry) => entry.isPlayer);
+  const visibleLeaderboard: Array<LeaderboardEntry | null> =
+    playerLeaderboardIndex < 0
+      ? []
+      : playerLeaderboardIndex < 7
+        ? leaderboard.slice(0, 7)
+        : [
+            ...leaderboard.slice(0, 3),
+            null,
+            leaderboard[playerLeaderboardIndex - 1],
+            leaderboard[playerLeaderboardIndex],
+            ...(leaderboard[playerLeaderboardIndex + 1] ? [leaderboard[playerLeaderboardIndex + 1]] : []),
+          ];
+  const playerLeaderboardEntry = playerLeaderboardIndex >= 0 ? leaderboard[playerLeaderboardIndex] : null;
+  const maxSellLiters = sell ? floorTenth(sell.fuel / 2) : 0;
 
   return (
     <div className="fixed inset-0 overflow-hidden bg-night-900 no-select text-slate-200">
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
 
+      {/* canvas карты всегда смонтирован, чтобы игровой движок мог обновлять его */}
+      <div
+        className={`absolute inset-0 z-[60] items-center justify-center bg-[rgba(4,7,14,0.88)] p-4 backdrop-blur-sm ${
+          mapOpen && phase === "play" ? "flex" : "hidden"
+        }`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Карта города"
+        onClick={() => setMapOpen(false)}
+      >
+        <div
+          className="flex max-h-[calc(100vh-2rem)] max-w-[1100px] flex-col gap-4 overflow-auto rounded-xl border border-night-600 bg-night-900/95 p-4 shadow-[0_30px_90px_rgba(0,0,0,0.72)] lg:flex-row"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="shrink-0">
+            <canvas
+              ref={minimapRef}
+              width={640}
+              height={640}
+              className="aspect-square w-[min(70vh,92vw)] max-w-[680px] rounded-lg border border-night-600 bg-[#0f1624] shadow-[inset_0_0_40px_rgba(0,0,0,0.5)]"
+            />
+          </div>
+          <div className="flex w-full min-w-0 flex-col lg:w-[260px]">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="flex items-center gap-2 text-[#7ee08a]">
+                  <MapIcon className="h-5 w-5" />
+                  <h2 className="font-display text-xl text-[#f2ecdf]">Карта города</h2>
+                </div>
+                <p className="mt-2 text-xs leading-relaxed text-slate-500">
+                  Игра продолжается. Положение игрока и конкурентов обновляется в реальном времени.
+                </p>
+              </div>
+              <button
+                onClick={() => setMapOpen(false)}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-night-600 text-xl text-slate-400 transition-colors hover:border-slate-500 hover:text-white"
+                aria-label="Закрыть карту"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="mt-5 grid grid-cols-1 gap-3 text-xs sm:grid-cols-2 lg:grid-cols-1">
+              <div className="flex items-start gap-2.5">
+                <span className="mt-1 h-3 w-5 shrink-0 rounded-[2px] border border-[#baf5c2] bg-[#7ee08a]" />
+                <span><strong className="font-semibold text-slate-200">Работающая АЗС</strong><small className="mt-0.5 block leading-snug text-slate-500">Заправляет бак и после использования закрывается.</small></span>
+              </div>
+              <div className="flex items-start gap-2.5">
+                <span className="relative mt-1 h-3 w-5 shrink-0 rounded-[2px] bg-[#333b49]"><span className="anim-pulse-soft absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#d95d4d] shadow-[0_0_7px_rgba(217,93,77,0.9)]" /></span>
+                <span><strong className="font-semibold text-slate-200">АЗС без топлива</strong><small className="mt-0.5 block leading-snug text-slate-500">Недоступна, пока её не откроет билборд или таймер.</small></span>
+              </div>
+              <div className="flex items-start gap-2.5">
+                <span className="mx-1 mt-1 h-3 w-3 shrink-0 rounded-full bg-amber-glow" />
+                <span><strong className="font-semibold text-slate-200">Доступный билборд</strong><small className="mt-0.5 block leading-snug text-slate-500">Открывает случайную неактивную АЗС.</small></span>
+              </div>
+              <div className="flex items-start gap-2.5">
+                <span className="mx-1 mt-1 h-3 w-3 shrink-0 rounded-sm bg-slate-500" />
+                <span><strong className="font-semibold text-slate-200">Недоступный билборд</strong><small className="mt-0.5 block leading-snug text-slate-500">Заблокирован на {CONFIG.billboardTimeout} с после активации или пока все АЗС работают.</small></span>
+              </div>
+              <div className="flex items-start gap-2.5">
+                <span className="mx-1 mt-1 h-3 w-3 shrink-0 rotate-45 rounded-[2px] bg-[#58c9f3]" />
+                <span><strong className="font-semibold text-slate-200">Канистра</strong><small className="mt-0.5 block leading-snug text-slate-500">Увеличивает объём бака на 10 л, но не добавляет топливо.</small></span>
+              </div>
+              <div className="flex items-start gap-2.5">
+                <span className="relative mt-0.5 flex h-4 w-5 shrink-0 items-center justify-center rounded-[2px] border border-[#b98cff] bg-[#4b356b]"><span className="flex h-4 w-4 items-center justify-center rounded-full bg-[#b98cff] text-[10px] font-bold text-night-950">₽</span></span>
+                <span><strong className="font-semibold text-slate-200">База скупки</strong><small className="mt-0.5 block leading-snug text-slate-500">Покупает не более 50% текущего топлива игрока.</small></span>
+              </div>
+              <div className="flex items-start gap-2.5">
+                <svg viewBox="0 0 18 16" className="mt-0.5 h-4 w-[18px] shrink-0" aria-hidden="true"><polygon points="16,8 3,14 3,2" fill="#e5472f" stroke="#fff4e8" strokeWidth="1.5" strokeLinejoin="round" /></svg>
+                <span><strong className="font-semibold text-slate-200">Твоя машина</strong><small className="mt-0.5 block leading-snug text-slate-500">Показывает положение и направление движения.</small></span>
+              </div>
+              <div className="flex items-start gap-2.5">
+                <span className="mt-1 flex w-[18px] shrink-0 items-center justify-center gap-0.5"><span className="h-2 w-2 rounded-full bg-[#8b5cf6]" /><span className="h-2 w-2 rounded-full bg-[#3fb7a8]" /></span>
+                <span><strong className="font-semibold text-slate-200">Конкуренты</strong><small className="mt-0.5 block leading-snug text-slate-500">Заправляются, занимают АЗС и участвуют в рейтинге.</small></span>
+              </div>
+            </div>
+
+            <div className="mt-auto pt-5 text-xs text-slate-500">
+              <span className="kbd">M</span> или <span className="kbd">ESC</span> — закрыть карту
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* ================= HUD ================= */}
       {phase === "play" && (
         <>
-          {/* левый верх: счёт */}
+          {/* левый верх: время и касса */}
           <div className="absolute top-4 left-4 z-10 pointer-events-none flex flex-col items-start gap-2">
-            <div className="flex items-center gap-2 bg-night-900/85 border border-night-600 rounded-md px-3 py-2">
-              <span className="text-amber-glow">
-                <BillBoardIcon />
-              </span>
-              <span className="font-display text-sm tracking-wide text-[#f2ecdf]">Клиенты</span>
-              <span className="font-display text-lg text-amber-glow leading-none">
-                {found}
-                <span className="text-slate-500 text-sm">/{CLIENTS.length}</span>
-              </span>
-            </div>
             <div className="flex items-center gap-2 bg-night-900/85 border border-night-600 rounded-md px-3 py-1.5 text-xs text-slate-400">
               <svg viewBox="0 0 24 24" fill="none" className="w-3.5 h-3.5">
                 <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" />
@@ -313,12 +418,18 @@ export default function App() {
             </div>
           </div>
 
-          {/* правый верх: портфель клиентов */}
-          <div className="absolute top-4 right-4 z-10 flex flex-col items-end gap-2">
-            <div className="flex items-center gap-2 pointer-events-auto">
-              <span className="text-[10px] uppercase tracking-[0.22em] text-slate-500 font-semibold">
-                Портфель клиентов
-              </span>
+          {/* правый верх: карта и звук */}
+          <div className="absolute top-4 right-4 z-10 pointer-events-auto flex items-center gap-2">
+              <button
+                onClick={() => setMapOpen(true)}
+                className="flex h-9 items-center gap-2 rounded-md border border-night-600 bg-night-900/85 px-2.5 text-slate-400 transition-colors hover:border-[#7ee08a]/50 hover:text-[#7ee08a]"
+                aria-label="Открыть карту города"
+                title="Карта города (M)"
+              >
+                <MapIcon className="h-4 w-4" />
+                <span className="hidden text-[10px] font-bold uppercase tracking-[0.12em] sm:inline">Карта</span>
+                <span className="kbd hidden lg:inline">M</span>
+              </button>
               <button
                 onClick={toggleMute}
                 className="w-9 h-9 rounded-md bg-night-900/85 border border-night-600 flex items-center justify-center text-slate-400 hover:text-amber-glow hover:border-night-600 transition-colors"
@@ -326,24 +437,6 @@ export default function App() {
               >
                 <SpeakerIcon muted={muted} />
               </button>
-            </div>
-            <div className="flex flex-wrap justify-end gap-1.5 max-w-[248px] pointer-events-none">
-              {CLIENTS.map((cl) => {
-                const got = foundIds.includes(cl.id);
-                return (
-                  <div
-                    key={cl.id}
-                    title={got ? cl.name : "Ещё не найден"}
-                    className={`w-10 h-10 rounded-md flex items-center justify-center font-display text-xs transition-colors ${
-                      got ? "anim-chip shadow-[0_4px_14px_rgba(0,0,0,0.45)]" : "border border-dashed border-slate-600 text-slate-600 bg-night-900/60"
-                    }`}
-                    style={got ? { background: cl.color, color: cl.ink } : undefined}
-                  >
-                    {got ? cl.mark : "?"}
-                  </div>
-                );
-              })}
-            </div>
           </div>
 
           {/* центр сверху: панель заправки (управление на это время заблокировано) */}
@@ -464,33 +557,67 @@ export default function App() {
             </div>
           </div>
 
-          {/* правый низ: легенда обозначений */}
-          <div className="absolute bottom-4 right-4 z-10 pointer-events-none flex flex-col items-end gap-1.5">
-            <div className="flex items-center gap-3 text-[10px] text-slate-500">
-              <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-amber-glow inline-block anim-pulse-soft" /> свободный щит
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-sm bg-slate-500 inline-block" /> подписан
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-[2px] bg-[#f2a93b] inline-block anim-pulse-soft" /> АЗС работает
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-[2px] bg-[#333b49] border border-[#a34a3e] inline-block" /> нет топлива
-              </span>
-              <span className="flex items-center gap-1">
-                <svg viewBox="0 0 24 24" fill="none" className="w-3 h-3 text-[#7ee08a]">
-                  <path d="M4 12h13M13 7l5 5-5 5" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                зелёная стрелка у края — направление и метры до работающей АЗС
-              </span>
-              <span className="flex items-center gap-1">
-                <svg viewBox="0 0 24 24" fill="none" className="w-3 h-3 text-[#58c9f3]">
-                  <path d="M4 12h13M13 7l5 5-5 5" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                голубая — до канистры (+10 л к баку)
-              </span>
+          {/* правый низ: рейтинг по залитым за сеанс литрам */}
+          <div
+            className={`absolute ${touch ? "bottom-[12rem]" : "bottom-4"} right-4 z-10 pointer-events-none flex flex-col items-end gap-2 max-w-[calc(100vw-2rem)]`}
+          >
+            <div className="w-[292px] overflow-hidden rounded-lg border border-night-600 bg-night-900/90 shadow-[0_12px_34px_rgba(0,0,0,0.46)]">
+              <div className="flex items-center justify-between gap-3 border-b border-night-700 px-3 py-2.5">
+                <div>
+                  <div className="font-display text-xs tracking-wide text-[#f2ecdf]">Лидеры смены</div>
+                  <div className="mt-0.5 text-[9px] uppercase tracking-[0.16em] text-slate-500">
+                    залито бензина за сеанс
+                  </div>
+                </div>
+                <div className="max-w-[126px] truncate rounded-full border border-[#e5472f]/40 bg-[#e5472f]/10 px-2 py-1 text-[10px] text-[#ffb7a8]">
+                  {playerLeaderboardEntry?.name ?? "игрок"}
+                </div>
+              </div>
+              <table className="w-full table-fixed text-[11px] tabular-nums">
+                <colgroup>
+                  <col className="w-9" />
+                  <col />
+                  <col className="w-[74px]" />
+                </colgroup>
+                <thead className="text-[9px] uppercase tracking-[0.14em] text-slate-600">
+                  <tr>
+                    <th className="px-2 pb-1 pt-2 text-center font-semibold">№</th>
+                    <th className="px-1 pb-1 pt-2 text-left font-semibold">Игрок</th>
+                    <th className="px-3 pb-1 pt-2 text-right font-semibold">Литры</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleLeaderboard.map((entry, index) =>
+                    entry === null ? (
+                      <tr key={`gap-${index}`}>
+                        <td colSpan={3} className="h-5 text-center text-slate-600">
+                          ···
+                        </td>
+                      </tr>
+                    ) : (
+                      <tr
+                        key={entry.name}
+                        className={entry.isPlayer ? "bg-[#e5472f]/20 text-[#ffe0d8]" : "text-slate-300"}
+                        style={entry.isPlayer ? { boxShadow: "inset 2px 0 #ff7158" } : undefined}
+                      >
+                        <td className={`px-2 py-1 text-center font-display ${entry.position <= 3 ? "text-[#ffd27a]" : "text-slate-500"}`}>
+                          {entry.position}
+                        </td>
+                        <td className="truncate px-1 py-1 font-semibold">
+                          <span
+                            className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full align-middle"
+                            style={{ backgroundColor: entry.color }}
+                          />
+                          {entry.name}
+                        </td>
+                        <td className="px-3 py-1 text-right font-display text-[#d6f7dc]">
+                          {entry.liters.toFixed(1)} л
+                        </td>
+                      </tr>
+                    )
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
 
@@ -502,9 +629,11 @@ export default function App() {
               <span className="kbd">S</span>
               <span className="kbd">D</span>
               движение
-              <span className="text-slate-600 mx-1">·</span>
-              <span className="kbd">SPACE</span> ручник
-              <span className="text-slate-600 mx-1">·</span>
+               <span className="text-slate-600 mx-1">·</span>
+               <span className="kbd">SPACE</span> ручник
+               <span className="text-slate-600 mx-1">·</span>
+               <span className="kbd">M</span> карта
+               <span className="text-slate-600 mx-1">·</span>
               врезайся в янтарные щиты
             </div>
           )}
@@ -554,7 +683,7 @@ export default function App() {
               <div className="flex items-center gap-2.5 text-amber-glow">
                 <BillBoardIcon />
                 <span className="font-display tracking-[0.14em] text-sm text-[#f2ecdf]">
-                  БИЛБОРД <span className="text-amber-glow">РАЛЛИ</span>
+                  ГДЕ <span className="text-amber-glow">БЕНЗ?</span>
                 </span>
               </div>
               <div className="flex items-center gap-2">
@@ -576,27 +705,19 @@ export default function App() {
               <div className="max-w-xl">
                 <div className="inline-flex items-center gap-2 rounded-full border border-amber-glow/40 bg-amber-glow/10 px-3.5 py-1.5 text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-glow">
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-glow anim-pulse-soft" />
-                  вид сверху · ночная смена · {CLIENTS.length} клиентов
+                  Вид сверху · Ночь · Заправки
                 </div>
                 <h1 className="font-display text-[44px] md:text-[64px] lg:text-[78px] leading-[0.95] mt-4 text-[#f2ecdf]">
-                  БИЛБОРД
+                  ГДЕ
                   <br />
-                  <span className="text-amber-glow">РАЛЛИ</span>
+                  <span className="text-amber-glow">БЕНЗ?</span>
                 </h1>
-                <p className="mt-4 text-slate-300 leading-relaxed max-w-md">
-                  Твои клиенты ждут рекламу. Гоняй по ночному району, находи свободные
-                  билборды — они подсвечены янтарным — и врезайся в них, чтобы подписать
-                  контракт. Каждый щит открывает лендинг клиента и активирует
-                  дополнительную заправку. В баке всего 50 литров, колонку занимает тот,
-                  кто встал под неё первым, — а по городу за тем же топливом гоняют
-                  конкуренты. Кончится топливо — смена сорвётся.
-                </p>
                 <div className="mt-6 flex items-center gap-5 flex-wrap">
                   <button
                     onClick={start}
                     className="rounded-md bg-amber-glow text-night-950 font-display text-base tracking-wide px-7 py-3.5 hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 shadow-[0_10px_34px_rgba(255,180,84,0.4)]"
                   >
-                    Выехать на маршрут
+                    Выехать на охоту
                   </button>
                   <span className="text-sm text-slate-500 anim-blink">
                     или нажми <span className="kbd">ENTER</span>
@@ -621,7 +742,10 @@ export default function App() {
                     <span className="kbd">SPACE</span> ручник — дрифт и следы
                   </div>
                   <div className="flex items-center gap-3">
-                    <span className="kbd">M</span> звук вкл/выкл
+                    <span className="kbd">M</span> карта города
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="kbd">V</span> звук вкл/выкл
                   </div>
                 </div>
                 <div className="mt-4 pt-3 border-t border-night-700 flex items-start gap-2.5 text-xs text-slate-400 leading-relaxed">
@@ -744,14 +868,14 @@ export default function App() {
             </div>
             <h2 className="font-display text-2xl mt-3 text-[#f2ecdf]">Сколько сливаем?</h2>
             <p className="mt-2 text-sm text-slate-400 leading-relaxed">
-              Принимают по {sell.price} ₽ за литр, без вопросов. В баке{" "}
-              <span className="text-slate-200 tabular-nums">{sell.fuel.toFixed(1)} л</span> — но домой ещё
-              ехать.
+              Принимают по {sell.price} ₽ за литр. В баке{" "}
+              <span className="text-slate-200 tabular-nums">{sell.fuel.toFixed(1)} л</span>, но база заберёт
+              не больше половины — максимум {maxSellLiters.toFixed(1)} л.
             </p>
 
             <div className="mt-5 flex items-baseline justify-between">
               <span className="font-display text-4xl text-[#f2ecdf] tabular-nums">
-                {sellLiters}
+                {sellLiters.toFixed(1)}
                 <span className="text-base text-slate-500 ml-1">л</span>
               </span>
               <span className="font-display text-2xl text-[#ffd27a] tabular-nums">
@@ -761,20 +885,20 @@ export default function App() {
             <input
               type="range"
               min={0}
-              max={Math.floor(sell.fuel)}
-              step={1}
+              max={maxSellLiters}
+              step={0.1}
               value={sellLiters}
               onChange={(e) => setSellLiters(Number(e.target.value))}
               className="mt-3 w-full accent-[#b98cff]"
             />
             <div className="mt-3 flex gap-2">
-              {[0.25, 0.5, 0.75, 1].map((f) => (
+              {SELL_PERCENTAGES.map((percent) => (
                 <button
-                  key={f}
-                  onClick={() => setSellLiters(Math.floor(sell.fuel * f))}
+                  key={percent}
+                  onClick={() => setSellLiters(floorTenth(sell.fuel * (percent / 100)))}
                   className="flex-1 rounded-md border border-night-600 bg-night-900/70 py-2 text-xs text-slate-300 hover:border-[#b98cff]/60 hover:text-[#f2ecdf] transition-colors"
                 >
-                  {Math.round(f * 100)}%
+                  {percent.toLocaleString("ru-RU")}%
                 </button>
               ))}
             </div>
@@ -783,7 +907,7 @@ export default function App() {
               <button
                 onClick={() => {
                   const paid = gameRef.current?.sellFuel(sellLiters) ?? 0;
-                  if (paid > 0) showToast(`Слито ${sellLiters} л — касса пополнилась на ${fmtMoney(paid)} ₽`);
+                  if (paid > 0) showToast(`Слито ${sellLiters.toFixed(1)} л — касса пополнилась на ${fmtMoney(paid)} ₽`);
                   setSell(null);
                 }}
                 disabled={sellLiters <= 0}
