@@ -25,6 +25,9 @@ export const CONFIG = {
    */
   stationTimeoutPerCanister: 1,
 
+  /** Длительность таймаута билборда после взаимодействия, в секундах. */
+  billboardTimeout: 20,
+
   /** Сколько литров в баке на старте заезда. */
   startFuel: 50,
 
