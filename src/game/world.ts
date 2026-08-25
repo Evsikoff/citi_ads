@@ -1,13 +1,20 @@
 import type { Client } from "./clients";
+import { CONFIG } from "./config";
 
 /* ------- константы мира (в пикселях мировых координат) ------- */
 export const BLOCK = 860; // размер квартала
 export const ROAD = 170; // ширина дороги
-export const GRID = 5; // 5×5 кварталов
+export const GRID = 10; // 10×10 кварталов — вчетверо больше площади, чем 5×5
 export const WORLD = GRID * BLOCK + (GRID + 1) * ROAD; // 5320
 export const SIDEWALK = 26; // тротуар по краю квартала
 const BUILD_INSET = 96; // здания не ближе этой границы (место под билборды)
 const STATION_PAD = 160; // размер площадки АЗС
+const STATIONS = 20; // АЗС на карту — вчетверо больше, чем было на 5×5
+const BASE_W = 300; // площадка базы нелегальной скупки
+const BASE_H = 200;
+const BASE_FROM_STATION = 1800; // база стоит на отшибе: не ближе этого к АЗС
+const BASE_FROM_BILLBOARD = 700; // и к рекламным щитам
+const BILLBOARDS_PER_CLIENT = 4; // столько щитов у каждого клиента по городу
 const STATION_MARGIN = 30; // отступ площадки от края квартала
 export const CANISTER_R = 20; // радиус канистры (он же радиус подбора)
 const CANISTER_SPREAD = 1400; // желаемый разброс канистр; ужимается, если их много
@@ -59,6 +66,14 @@ export interface Station extends Rect {
   by: number; // начало квартала по y
   state: StationState; // «нет топлива» или работает
   origin: StationOrigin; // источник активации (важно: «рекламные» не открывают следующие)
+  price: number; // рублей за литр — у каждой колонки своя цена
+  limit: number | null; // сколько литров отпускает за одну заправку; null — без ограничения
+}
+
+/** база нелегальной скупки: сюда возят бензин на продажу */
+export interface Base extends Rect {
+  bx: number;
+  by: number;
 }
 
 /** канистра: лежит на проезжей части, наезд = подбор */
@@ -77,6 +92,7 @@ export interface City {
   trees: Tree[];
   lamps: Lamp[];
   stations: Station[];
+  base: Base;
   canisters: Canister[];
   roadCenters: number[];
 }
@@ -201,27 +217,42 @@ export function buildCity(clients: Client[], canisterCount = 0, start?: { x: num
   /* ------- АЗС: углы кварталов, распределённые по городу ------- */
   const stations: Station[] = [];
   const isParkBlock = (b: Rect) => parks.some((p) => p.x === b.x && p.y === b.y);
-  const stationSpecs: Array<{ gx: number; gy: number; c: 0 | 1 | 2 | 3 }> = [
-    { gx: 0, gy: 2, c: 1 },
-    { gx: 4, gy: 1, c: 2 },
-    { gx: 2, gy: 0, c: 3 },
-    { gx: 1, gy: 4, c: 0 },
-    { gx: 3, gy: 3, c: 1 },
-    { gx: 0, gy: 0, c: 3 },
-    { gx: 4, gy: 4, c: 0 },
-    { gx: 2, gy: 3, c: 2 },
-    { gx: 3, gy: 1, c: 0 },
-    { gx: 1, gy: 1, c: 3 },
-  ];
-  for (const s of stationSpecs) {
-    if (stations.length >= 5) break;
-    const b = blocks[s.gx * GRID + s.gy];
-    if (isParkBlock(b)) continue;
-    const x = s.c === 1 || s.c === 3 ? b.x + BLOCK - STATION_PAD - STATION_MARGIN : b.x + STATION_MARGIN;
-    const y = s.c === 2 || s.c === 3 ? b.y + BLOCK - STATION_PAD - STATION_MARGIN : b.y + STATION_MARGIN;
-    const pad: Rect = { x, y, w: STATION_PAD, h: STATION_PAD };
-    if (stations.some((st) => hit(grow(st, 400), pad))) continue;
-    stations.push({ ...pad, corner: s.c, bx: b.x, by: b.y, state: "locked", origin: "start" });
+  const stationSpots: Array<{ gx: number; gy: number; c: 0 | 1 | 2 | 3 }> = [];
+  for (let gx = 0; gx < GRID; gx++) {
+    for (let gy = 0; gy < GRID; gy++) {
+      stationSpots.push({ gx, gy, c: (Math.floor(rng() * 4) as 0 | 1 | 2 | 3) });
+    }
+  }
+  for (let i = stationSpots.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [stationSpots[i], stationSpots[j]] = [stationSpots[j], stationSpots[i]];
+  }
+  // сначала пытаемся развести заправки пошире, потом ужимаем требование
+  for (let apart = BLOCK * 1.7; stations.length < STATIONS && apart > 300; apart *= 0.75) {
+    stations.length = 0;
+    for (const s of stationSpots) {
+      if (stations.length >= STATIONS) break;
+      const b = blocks[s.gx * GRID + s.gy];
+      if (isParkBlock(b)) continue;
+      const x = s.c === 1 || s.c === 3 ? b.x + BLOCK - STATION_PAD - STATION_MARGIN : b.x + STATION_MARGIN;
+      const y = s.c === 2 || s.c === 3 ? b.y + BLOCK - STATION_PAD - STATION_MARGIN : b.y + STATION_MARGIN;
+      const pad: Rect = { x, y, w: STATION_PAD, h: STATION_PAD };
+      if (stations.some((st) => hit(grow(st, apart), pad))) continue;
+      const price = Math.round(
+        CONFIG.stationPriceMin + rng() * Math.max(0, CONFIG.stationPriceMax - CONFIG.stationPriceMin)
+      );
+      const limit = rng() < CONFIG.stationLimitChance ? CONFIG.stationFuelLimit : null;
+      stations.push({
+        ...pad,
+        corner: s.c,
+        bx: b.x,
+        by: b.y,
+        state: "locked",
+        origin: "start",
+        price,
+        limit,
+      });
+    }
   }
 
   /* здания и деревья не должны стоять на площадке АЗС */
@@ -270,7 +301,9 @@ export function buildCity(clients: Client[], canisterCount = 0, start?: { x: num
     [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
   }
   const billboards: Billboard[] = [];
-  const shuffledClients = [...clients];
+  // каждый клиент выкупает несколько щитов: город вырос, кампания тоже
+  const shuffledClients: Client[] = [];
+  for (let pass = 0; pass < BILLBOARDS_PER_CLIENT; pass++) shuffledClients.push(...clients);
   for (let i = shuffledClients.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
     [shuffledClients[i], shuffledClients[j]] = [shuffledClients[j], shuffledClients[i]];
@@ -290,6 +323,59 @@ export function buildCity(clients: Client[], canisterCount = 0, start?: { x: num
         ? { x: cd.x, y: cd.y, w: BH, h: BW, client, discovered: false, vertical: true }
         : { x: cd.x, y: cd.y, w: BW, h: BH, client, discovered: false, vertical: false }
     );
+  }
+
+  /* ------- база нелегальной скупки: на отшибе, подальше от АЗС и щитов ------- */
+  let base: Base | null = null;
+  const baseSpots: Array<{ gx: number; gy: number; c: 0 | 1 | 2 | 3 }> = [];
+  for (let gx = 0; gx < GRID; gx++) {
+    for (let gy = 0; gy < GRID; gy++) {
+      baseSpots.push({ gx, gy, c: (Math.floor(rng() * 4) as 0 | 1 | 2 | 3) });
+    }
+  }
+  for (let i = baseSpots.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [baseSpots[i], baseSpots[j]] = [baseSpots[j], baseSpots[i]];
+  }
+  // требование «на отшибе» ослабляем, только если совсем не нашлось места
+  for (let far = 1; !base && far > 0.3; far *= 0.75) {
+    for (const sp of baseSpots) {
+      const b = blocks[sp.gx * GRID + sp.gy];
+      if (isParkBlock(b)) continue;
+      const x = sp.c === 1 || sp.c === 3 ? b.x + BLOCK - BASE_W - STATION_MARGIN : b.x + STATION_MARGIN;
+      const y = sp.c === 2 || sp.c === 3 ? b.y + BLOCK - BASE_H - STATION_MARGIN : b.y + STATION_MARGIN;
+      const pad: Rect = { x, y, w: BASE_W, h: BASE_H };
+      const cx = x + BASE_W / 2;
+      const cy = y + BASE_H / 2;
+      const farFromStations = stations.every(
+        (st) => Math.hypot(st.x + st.w / 2 - cx, st.y + st.h / 2 - cy) > BASE_FROM_STATION * far
+      );
+      if (!farFromStations) continue;
+      const farFromBillboards = billboards.every(
+        (bb) => Math.hypot(bb.x + bb.w / 2 - cx, bb.y + bb.h / 2 - cy) > BASE_FROM_BILLBOARD * far
+      );
+      if (!farFromBillboards) continue;
+      if (start && Math.hypot(cx - start.x, cy - start.y) < 900) continue;
+      base = { ...pad, bx: b.x, by: b.y };
+      break;
+    }
+  }
+  if (!base) base = { x: ROAD, y: ROAD, w: BASE_W, h: BASE_H, bx: ROAD, by: ROAD };
+  const baseRect = base;
+  // на площадке базы не должно быть ни зданий, ни деревьев
+  for (let i = buildings.length - 1; i >= 0; i--) {
+    if (hit(grow(baseRect, 26), buildings[i])) buildings.splice(i, 1);
+  }
+  for (let i = trees.length - 1; i >= 0; i--) {
+    const tr = trees[i];
+    if (
+      tr.x > baseRect.x - 24 &&
+      tr.x < baseRect.x + baseRect.w + 24 &&
+      tr.y > baseRect.y - 24 &&
+      tr.y < baseRect.y + baseRect.h + 24
+    ) {
+      trees.splice(i, 1);
+    }
   }
 
   /* ------- канистры: только на проезжей части, значит игрок точно доедет ------- */
@@ -319,5 +405,5 @@ export function buildCity(clients: Client[], canisterCount = 0, start?: { x: num
     }
   }
 
-  return { blocks, parks, buildings, billboards, trees, lamps, stations, canisters, roadCenters };
+  return { blocks, parks, buildings, billboards, trees, lamps, stations, base: baseRect, canisters, roadCenters };
 }
