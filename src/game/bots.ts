@@ -41,6 +41,9 @@ export interface Bot {
   wait: number; // стоим под колонкой, с
   think: number; // до пересчёта цели, с
   taken: number; // сколько канистр забрал за заезд
+  kx: number; // скорость отлёта после тарана
+  ky: number;
+  stun: number; // пока > 0 — руль и газ не работают, машину несёт
 }
 
 /** что бот сделал на этом кадре — движку нужно для эффектов и экономики АЗС */
@@ -184,6 +187,20 @@ function waypoint(b: Bot, city: City, gx: number, gy: number): { x: number; y: n
   return Math.abs(b.x - myCol) < Math.abs(b.y - myRow) ? { x: myCol, y: b.y } : { x: b.x, y: myRow };
 }
 
+/** отлёт после тарана: гасим импульс и двигаем машину независимо от руля */
+function applyKnock(b: Bot, dt: number): void {
+  if (b.kx === 0 && b.ky === 0) return;
+  b.x = clamp(b.x + b.kx * dt, 30, WORLD - 30);
+  b.y = clamp(b.y + b.ky * dt, 30, WORLD - 30);
+  const decay = Math.exp(-3.4 * dt);
+  b.kx *= decay;
+  b.ky *= decay;
+  if (Math.hypot(b.kx, b.ky) < 4) {
+    b.kx = 0;
+    b.ky = 0;
+  }
+}
+
 function drive(b: Bot, wx: number, wy: number, dt: number): void {
   const want = Math.atan2(wy - b.y, wx - b.x);
   let d = want - b.angle;
@@ -227,6 +244,9 @@ export function createBots(city: City, count: number, start: { x: number; y: num
       wait: 0,
       think: 0,
       taken: 0,
+      kx: 0,
+      ky: 0,
+      stun: 0,
     };
     rollPlan(bot);
     bots.push(bot);
@@ -236,6 +256,14 @@ export function createBots(city: City, count: number, start: { x: number; y: num
 
 export function stepBot(b: Bot, city: City, dt: number): BotStep {
   const step: BotStep = { tookCanister: false, refuelAt: null };
+  applyKnock(b, dt);
+  if (b.stun > 0) {
+    // получил в бок — пару мгновений машину просто несёт
+    b.stun -= dt;
+    b.speed *= Math.max(0, 1 - 4 * dt);
+    b.think = 0;
+    return step;
+  }
   if (b.wait > 0) {
     // стоим под колонкой
     b.wait -= dt;
@@ -255,7 +283,7 @@ export function stepBot(b: Bot, city: City, dt: number): BotStep {
   // канистру подбираем любую, на которую наехали, — она и есть «по пути»
   const rr = (BOT_R + CANISTER_R) * (BOT_R + CANISTER_R);
   for (const k of city.canisters) {
-    if (k.taken) continue;
+    if (k.taken || k.cool > 0) continue;
     const dx = b.x - k.x;
     const dy = b.y - k.y;
     if (dx * dx + dy * dy > rr) continue;

@@ -66,6 +66,7 @@ export interface Canister {
   x: number;
   y: number;
   taken: boolean;
+  cool: number; // пауза перед подбором — чтобы выбитая канистра не влетала обратно
 }
 
 export interface City {
@@ -314,7 +315,7 @@ export function buildCity(clients: Client[], canisterCount = 0, start?: { x: num
       if (canisters.length >= canisterCount) break;
       if (start && Math.hypot(sp.x - start.x, sp.y - start.y) < CANISTER_FROM_START) continue;
       if (canisters.some((k) => Math.hypot(k.x - sp.x, k.y - sp.y) < spread)) continue;
-      canisters.push({ x: sp.x, y: sp.y, taken: false });
+      canisters.push({ x: sp.x, y: sp.y, taken: false, cool: 0 });
     }
   }
 

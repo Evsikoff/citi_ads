@@ -165,6 +165,12 @@ export default function App() {
         showToast(`Колонка занята — АЗС закрылась. Активных станций: ${active} из ${total}`),
       onCanister: (count, liters) =>
         showToast(`Канистра подобрана: бак вырос на ${liters} л. Канистр у тебя: ${count}`),
+      onCanisterLost: (count, left) =>
+        showToast(
+          count > 1
+            ? `Тебя протаранили — из багажника вылетело ${count} канистры. Осталось: ${left}`
+            : `Тебя протаранили — канистра вылетела на дорогу. Осталось: ${left}`
+        ),
     });
     gameRef.current = game;
     return () => {
