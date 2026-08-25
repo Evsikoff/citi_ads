@@ -5,6 +5,7 @@ import type { Client } from "./game/clients";
 import { CityRideGame } from "./game/engine";
 import type { HudData } from "./game/engine";
 import { sfx } from "./game/audio";
+import { CONFIG } from "./game/config";
 import { ClientModal } from "./components/ClientModal";
 
 const fmt = (t: number) => {
@@ -164,7 +165,7 @@ export default function App() {
       onStationLock: (active, total) =>
         showToast(`Колонка занята — АЗС закрылась. Активных станций: ${active} из ${total}`),
       onCanister: (count, liters) =>
-        showToast(`Канистра подобрана: бак вырос на ${liters} л. Канистр у тебя: ${count}`),
+        showToast(`Канистра подобрана: бак вырос на ${liters} л (топливо не прибавилось). Канистр у тебя: ${count}`),
       onCanisterLost: (count, left) =>
         showToast(
           count > 1
@@ -584,10 +585,12 @@ export default function App() {
                   <span className="mt-0.5 text-[#f2a93b] shrink-0">
                     <FuelIcon className="w-4 h-4" />
                   </span>
-                  Стартовый бак — 50 л, работающая АЗС льёт 10 л/с. После заправки станция
-                  закрывается, а через секунду открывается следующая. Просмотр рекламы на
-                  билборде активирует дополнительную АЗС — но заправка на ней новых станций не открывает.
-                  Пустой бак — начинаешь заново.
+                  Стартовый бак — 50 л, работающая АЗС льёт 10 л/с. Кто первым встал под колонку, тот
+                  её и занял: АЗС закрывается сразу, а другая случайная открывается через{" "}
+                  {CONFIG.stationTimeoutBase} с плюс {CONFIG.stationTimeoutPerCanister} с за каждую
+                  канистру заправляющегося. Просмотр рекламы на билборде активирует дополнительную АЗС —
+                  но заправка на ней новых станций не открывает. По городу катаются конкуренты: они тоже
+                  забирают канистры и занимают колонки. Пустой бак — начинаешь заново.
                 </div>
               </div>
             </div>

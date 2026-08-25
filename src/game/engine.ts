@@ -1,10 +1,11 @@
-import { buildCity, WORLD, ROAD, SIDEWALK, BLOCK, CANISTER_R } from "./world";
+import { buildCity, WORLD, ROAD, SIDEWALK, BLOCK, GRID, CANISTER_R } from "./world";
 import type { City, Rect, Billboard, Tree, Lamp, Station, Canister } from "./world";
 import type { Client } from "./clients";
 import { sfx } from "./audio";
 import { createBots, stepBot } from "./bots";
 import type { Bot } from "./bots";
 import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
+import { CONFIG } from "./config";
 
 export interface HudData {
   speed: number;
@@ -63,15 +64,15 @@ const PLAYERS = 1 + BOTS; // участников заезда: игрок и б
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
 const CANISTER_L = 10; // на столько литров канистра увеличивает бак
 const REFUEL_RATE = 10; // л/с на работающей АЗС
-const UNLOCK_BASE_S = 2; // T = 2 + канистры у заправляющейся машины
+// T = базовый таймаут + надбавка за каждую канистру, оба значения из config.ts
 const M_PER_PX = 0.35; // метров в мировом пикселе — для подписей с дистанцией
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
 const PLAYER_COLOR = "#e5472f"; // машина игрока — единственная красная
 
-// точка старта: середина третьей вертикальной улицы
-const START = { x: ROAD / 2 + 2 * (BLOCK + ROAD), y: WORLD * 0.66 };
+// точка старта: средняя вертикальная улица, чуть ниже центра города
+const START = { x: ROAD / 2 + Math.floor(GRID / 2) * (BLOCK + ROAD), y: WORLD * 0.62 };
 
 function shade(hex: string, f: number): string {
   const n = parseInt(hex.slice(1), 16);
@@ -202,7 +203,7 @@ export class CityRideGame {
     this.mini = minimap;
     if (minimap) this.mctx = minimap.getContext("2d");
     this.city = buildCity(clients, CANISTERS_ON_MAP, { x: START.x, y: START.y });
-    this.total = this.city.billboards.length;
+    this.total = new Set(this.city.billboards.map((b) => b.client.id)).size;
     this.cb = cb;
     this.placeCar();
     this.initStations();
@@ -547,13 +548,8 @@ export class CityRideGame {
       if (dx * dx + dy * dy > rr) continue;
       k.taken = true;
       this.canisters += 1;
+      // канистра увеличивает только объём бака: топлива в нём не прибавляется
       this.fuelMax += CANISTER_L;
-      this.fuel = Math.min(this.fuelMax, this.fuel + CANISTER_L);
-      // канистра заводит заглохшую машину, если игра ещё не закончена
-      if (this.stalled && !this.gameOverSent) {
-        this.stalled = false;
-        sfx.engineStart();
-      }
       for (let i = 0; i < 18; i++) {
         this.spawn(k.x, k.y, "spark", i % 2 ? CANISTER_ACCENT : "#d8f2ff", 0.7, 150);
       }
@@ -849,10 +845,12 @@ export class CityRideGame {
     const sp = Math.abs(c.speed);
     const speed01 = sp / MAX_SPEED;
     const up = this.keys.has("up");
+    // доли считаются от «расхода на полном газу»: холостой ход, газ и ручник
     const burn =
-      0.05 +
-      (up && !this.stalled ? 0.24 + speed01 * 0.28 : 0) +
-      (this.keys.has("hb") && sp > 250 ? 0.22 : 0);
+      CONFIG.fuelBurnPerSecond *
+      (0.09 +
+        (up && !this.stalled ? 0.42 + speed01 * 0.49 : 0) +
+        (this.keys.has("hb") && sp > 250 ? 0.39 : 0));
     if (!this.stalled) {
       // под колонкой топливо не жжём — машина стоит с заглушённым мотором
       if (!this.refueling) {
@@ -970,7 +968,8 @@ export class CityRideGame {
       this.cb.onStationLock(this.stationsActive, this.city.stations.length);
     }
     if (s.origin !== "ad") {
-      this.unlockQueue.push({ t: UNLOCK_BASE_S + canisters, from: s, notify });
+      const t = CONFIG.stationTimeoutBase + CONFIG.stationTimeoutPerCanister * canisters;
+      this.unlockQueue.push({ t, from: s, notify });
     }
   }
 
@@ -1102,7 +1101,8 @@ export class CityRideGame {
   }
 
   private discover(b: Billboard): void {
-    b.discovered = true;
+    // клиент подписан — остальные его щиты по городу тоже считаются отработанными
+    for (const o of this.city.billboards) if (o.client.id === b.client.id) o.discovered = true;
     this.found += 1;
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2 - 20;
@@ -1582,7 +1582,7 @@ export class CityRideGame {
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.fillStyle = rgba(CANISTER_ACCENT, 0.7 + 0.3 * pulse);
-      ctx.fillText(`+${CANISTER_L} л`, 0, 24 - bob);
+      ctx.fillText(`бак +${CANISTER_L} л`, 0, 24 - bob);
       ctx.textAlign = "left";
       ctx.textBaseline = "alphabetic";
       ctx.restore();
