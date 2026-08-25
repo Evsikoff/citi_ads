@@ -95,16 +95,22 @@ function fmtDistance(meters: number): string {
     : `${Math.round(meters / 10) * 10} м`;
 }
 
-// иконка АЗС (тот же контур, что у FuelIcon в интерфейсе), viewBox 24x24
+// иконки для указателей — те же контуры, что в интерфейсе, viewBox 24x24
 const FUEL_ICON_PATH =
   "M5 21V6a2 2 0 012-2h5a2 2 0 012 2v15M4 21h11M14 10h2a2 2 0 012 2v5a1.5 1.5 0 003 0v-7.5L18.5 7M7 8h5v4H7z";
-let fuelIconCache: Path2D | null | undefined;
-function fuelIcon(): Path2D | null {
-  if (fuelIconCache === undefined) {
-    fuelIconCache = typeof Path2D === "function" ? new Path2D(FUEL_ICON_PATH) : null;
+const CANISTER_ICON_PATH =
+  "M6 7.5A1.5 1.5 0 017.5 6h9A1.5 1.5 0 0118 7.5v11A1.5 1.5 0 0116.5 20h-9A1.5 1.5 0 016 18.5v-11zM9 6V4.5h6V6M8.5 9.5l7 7";
+const iconCache = new Map<string, Path2D | null>();
+function icon(path: string): Path2D | null {
+  if (!iconCache.has(path)) {
+    iconCache.set(path, typeof Path2D === "function" ? new Path2D(path) : null);
   }
-  return fuelIconCache;
+  return iconCache.get(path) ?? null;
 }
+
+// цвета указателей: АЗС — зелёные, канистры — голубые
+const STATION_ACCENT = "#7ee08a";
+const CANISTER_ACCENT = "#58c9f3";
 
 export class CityRideGame {
   private cv: HTMLCanvasElement;
@@ -513,7 +519,7 @@ export class CityRideGame {
         sfx.engineStart();
       }
       for (let i = 0; i < 18; i++) {
-        this.spawn(k.x, k.y, "spark", i % 2 ? "#7ee08a" : "#d8f7c2", 0.7, 150);
+        this.spawn(k.x, k.y, "spark", i % 2 ? CANISTER_ACCENT : "#d8f2ff", 0.7, 150);
       }
       sfx.chime();
       this.cb.onCanister(this.canisters, CANISTER_L);
@@ -898,7 +904,7 @@ export class CityRideGame {
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, w, h);
 
-    if (this.phase === "play") this.drawStationPointers(shx, shy);
+    if (this.phase === "play") this.drawPointers(shx, shy);
 
     this.drawMinimap();
   }
@@ -1171,8 +1177,8 @@ export class CityRideGame {
 
       // подсветка на асфальте
       const g = ctx.createRadialGradient(0, 0, 2, 0, 0, 34);
-      g.addColorStop(0, `rgba(126,224,138,${0.34 * pulse})`);
-      g.addColorStop(1, "rgba(126,224,138,0)");
+      g.addColorStop(0, rgba(CANISTER_ACCENT, 0.34 * pulse));
+      g.addColorStop(1, rgba(CANISTER_ACCENT, 0));
       ctx.fillStyle = g;
       ctx.beginPath();
       ctx.arc(0, 0, 34, 0, Math.PI * 2);
@@ -1185,33 +1191,33 @@ export class CityRideGame {
 
       ctx.translate(0, bob);
       // корпус канистры
-      ctx.fillStyle = "#3f9e5c";
+      ctx.fillStyle = shade(CANISTER_ACCENT, 0.62);
       ctx.beginPath();
       ctx.roundRect(-11, -14, 22, 25, 4);
       ctx.fill();
-      ctx.strokeStyle = "rgba(10,26,16,0.75)";
+      ctx.strokeStyle = "rgba(8,22,32,0.75)";
       ctx.lineWidth = 1.6;
       ctx.stroke();
       // светлая грань и рёбра жёсткости
-      ctx.fillStyle = "rgba(180,240,190,0.5)";
+      ctx.fillStyle = rgba("#d8f2ff", 0.5);
       ctx.beginPath();
       ctx.roundRect(-8.5, -11.5, 6, 20, 2.5);
       ctx.fill();
-      ctx.strokeStyle = "rgba(12,32,18,0.45)";
+      ctx.strokeStyle = "rgba(8,26,38,0.45)";
       ctx.lineWidth = 1.2;
       ctx.beginPath();
       ctx.moveTo(-1, -10);
       ctx.lineTo(7.5, 7);
       ctx.stroke();
       // ручка и горловина
-      ctx.strokeStyle = "#2b7a45";
+      ctx.strokeStyle = shade(CANISTER_ACCENT, 0.48);
       ctx.lineWidth = 3;
       ctx.lineCap = "round";
       ctx.beginPath();
       ctx.moveTo(-6, -15.5);
       ctx.lineTo(6, -15.5);
       ctx.stroke();
-      ctx.fillStyle = "#d9f7c6";
+      ctx.fillStyle = shade(CANISTER_ACCENT, 1.35);
       ctx.beginPath();
       ctx.arc(8.5, -13.5, 2.6, 0, Math.PI * 2);
       ctx.fill();
@@ -1220,7 +1226,7 @@ export class CityRideGame {
       ctx.font = "700 11px Rubik, system-ui, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillStyle = `rgba(214,247,220,${0.65 + 0.35 * pulse})`;
+      ctx.fillStyle = rgba(CANISTER_ACCENT, 0.7 + 0.3 * pulse);
       ctx.fillText(`+${CANISTER_L} л`, 0, 24 - bob);
       ctx.textAlign = "left";
       ctx.textBaseline = "alphabetic";
@@ -1578,11 +1584,11 @@ export class CityRideGame {
     ctx.restore();
   }
 
-  /* ---------------- указатели на активные АЗС ---------------- */
+  /* ---------------- указатели на цели по краям экрана ---------------- */
 
-  // Зелёные стрелки по краям экрана: направление и расстояние до каждой работающей АЗС.
+  // Стрелки по краям экрана: зелёные — на работающие АЗС, голубые — на канистры.
   // Считаются каждый кадр от текущего положения камеры и машины, поэтому живут в реальном времени.
-  private drawStationPointers(shx: number, shy: number): void {
+  private drawPointers(shx: number, shy: number): void {
     const w = this.vw;
     const h = this.vh;
     const zoom = this.cam.zoom;
@@ -1590,50 +1596,71 @@ export class CityRideGame {
     const margin = clamp(Math.min(w, h) * 0.09, 26, 46);
     // снизу зарезервировано место под подсказку по управлению и легенду
     const bottom = Math.min(margin + 56, h * 0.4);
+    // на время заправки сверху висит панель — уводим указатели ниже неё
+    const top = this.refueling ? Math.min(margin + 104, h * 0.4) : margin;
     const l = margin;
     const r = w - margin;
-    const t0 = margin;
+    const t0 = top;
     const b0 = h - bottom;
 
+    const targets: Array<{ x: number; y: number; accent: string; iconPath: string }> = [];
     for (const st of this.city.stations) {
       if (st.state !== "active") continue;
-      const wx = st.x + st.w / 2;
-      const wy = st.y + st.h / 2;
-      // экранные координаты станции (с учётом тряски камеры — как и весь кадр)
-      const sx = w / 2 + shx + (wx - this.cam.x) * zoom;
-      const sy = h / 2 + shy + (wy - this.cam.y) * zoom;
-      // станция и так видна — указатель не нужен
+      targets.push({
+        x: st.x + st.w / 2,
+        y: st.y + st.h / 2,
+        accent: STATION_ACCENT,
+        iconPath: FUEL_ICON_PATH,
+      });
+    }
+    for (const k of this.city.canisters) {
+      if (k.taken) continue;
+      targets.push({ x: k.x, y: k.y, accent: CANISTER_ACCENT, iconPath: CANISTER_ICON_PATH });
+    }
+
+    for (const g of targets) {
+      // экранные координаты цели (с учётом тряски камеры — как и весь кадр)
+      const sx = w / 2 + shx + (g.x - this.cam.x) * zoom;
+      const sy = h / 2 + shy + (g.y - this.cam.y) * zoom;
+      // цель и так видна — указатель не нужен
       if (sx > l && sx < r && sy > t0 && sy < b0) continue;
 
       const dx = sx - w / 2;
       const dy = sy - h / 2;
       if (Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) continue;
-      // упираем луч «центр экрана → станция» в границы безопасной зоны
+      // упираем луч «центр экрана → цель» в границы безопасной зоны
       const tx = Math.abs(dx) > 0.001 ? ((dx > 0 ? r : l) - w / 2) / dx : Infinity;
       const ty = Math.abs(dy) > 0.001 ? ((dy > 0 ? b0 : t0) - h / 2) / dy : Infinity;
       const t = Math.max(Math.min(tx, ty), 0);
       const px = w / 2 + dx * t;
       const py = h / 2 + dy * t;
 
-      const meters = Math.hypot(wx - this.car.x, wy - this.car.y) * M_PER_PX;
-      const pulse = 0.78 + 0.22 * Math.sin(this.wall * 3 + st.x * 0.01);
-      this.drawStationPointer(px, py, Math.atan2(dy, dx), fmtDistance(meters), pulse);
+      const meters = Math.hypot(g.x - this.car.x, g.y - this.car.y) * M_PER_PX;
+      const pulse = 0.78 + 0.22 * Math.sin(this.wall * 3 + g.x * 0.01);
+      this.drawPointer(px, py, Math.atan2(dy, dx), fmtDistance(meters), pulse, g.accent, g.iconPath);
     }
   }
 
-  private drawStationPointer(px: number, py: number, ang: number, label: string, pulse: number): void {
+  private drawPointer(
+    px: number,
+    py: number,
+    ang: number,
+    label: string,
+    pulse: number,
+    accent: string,
+    iconPath: string
+  ): void {
     const { ctx } = this;
-    const GREEN = "#7ee08a";
     ctx.save();
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 
-    // стрелка у края, смотрит на станцию
+    // стрелка у края, смотрит на цель
     ctx.save();
     ctx.translate(px, py);
     ctx.rotate(ang);
-    ctx.shadowColor = `rgba(126,224,138,${0.55 * pulse})`;
+    ctx.shadowColor = rgba(accent, 0.55 * pulse);
     ctx.shadowBlur = 12;
-    ctx.fillStyle = GREEN;
+    ctx.fillStyle = accent;
     ctx.globalAlpha = pulse;
     ctx.beginPath();
     ctx.moveTo(15, 0);
@@ -1644,20 +1671,20 @@ export class CityRideGame {
     ctx.fill();
     ctx.shadowBlur = 0;
     ctx.globalAlpha = 1;
-    ctx.strokeStyle = "rgba(9,20,13,0.8)";
+    ctx.strokeStyle = "rgba(6,14,20,0.8)";
     ctx.lineWidth = 1.2;
     ctx.stroke();
     ctx.restore();
 
-    // плашка: иконка АЗС + расстояние, всегда горизонтальная — иначе не прочитать
-    const icon = 14;
+    // плашка: иконка цели + расстояние, всегда горизонтальная — иначе не прочитать
+    const iconSize = 14;
     const padX = 7;
     const gap = 5;
     ctx.font = '700 12px Rubik, system-ui, sans-serif';
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     const tw = ctx.measureText(label).width;
-    const bw = padX * 2 + icon + gap + tw;
+    const bw = padX * 2 + iconSize + gap + tw;
     const bh = 22;
     // сдвигаем плашку от стрелки внутрь экрана и не даём ей вылезти за границы
     const off = 13 + Math.max(bw, bh) * 0.4;
@@ -1668,18 +1695,18 @@ export class CityRideGame {
 
     ctx.beginPath();
     ctx.roundRect(left, top, bw, bh, 7);
-    ctx.fillStyle = "rgba(8,16,14,0.82)";
+    ctx.fillStyle = "rgba(8,14,20,0.84)";
     ctx.fill();
-    ctx.strokeStyle = `rgba(126,224,138,${0.35 + 0.25 * pulse})`;
+    ctx.strokeStyle = rgba(accent, 0.35 + 0.25 * pulse);
     ctx.lineWidth = 1;
     ctx.stroke();
 
-    const ic = fuelIcon();
+    const ic = icon(iconPath);
     if (ic) {
       ctx.save();
-      ctx.translate(left + padX, by - icon / 2);
-      ctx.scale(icon / 24, icon / 24);
-      ctx.strokeStyle = GREEN;
+      ctx.translate(left + padX, by - iconSize / 2);
+      ctx.scale(iconSize / 24, iconSize / 24);
+      ctx.strokeStyle = accent;
       ctx.lineWidth = 2;
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
@@ -1687,8 +1714,8 @@ export class CityRideGame {
       ctx.restore();
     }
 
-    ctx.fillStyle = "#d6f7dc";
-    ctx.fillText(label, left + padX + icon + gap, by + 0.5);
+    ctx.fillStyle = shade(accent, 1.35);
+    ctx.fillText(label, left + padX + iconSize + gap, by + 0.5);
     ctx.restore();
   }
 

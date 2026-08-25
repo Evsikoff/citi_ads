@@ -130,7 +130,8 @@ export default function App() {
         }
         if (fuelTextRef.current) fuelTextRef.current.textContent = `${Math.round(f)} л`;
         if (fuelIconRef.current) fuelIconRef.current.style.color = fr < 0.22 ? "#ff6b5a" : "#7ee08a";
-        if (refuelRef.current) refuelRef.current.style.opacity = h.refueling ? "1" : "0";
+        // индикатор переключаем через display: opacity перебивается анимацией anim-blink
+        if (refuelRef.current) refuelRef.current.style.display = h.refueling ? "inline" : "none";
         if (refuelPanelRef.current) refuelPanelRef.current.style.display = h.refueling ? "flex" : "none";
         if (h.refueling) {
           if (refuelLitersRef.current) refuelLitersRef.current.textContent = `${Math.round(f)} / ${Math.round(fm)} л`;
@@ -306,7 +307,7 @@ export default function App() {
               0 / 50 л
             </span>
             <span className="flex items-center gap-1.5 text-[11px] text-slate-400">
-              <span className="text-[#7ee08a]">
+              <span className="text-[#58c9f3]">
                 <CanisterIcon className="w-4 h-4" />
               </span>
               канистр у тебя:
@@ -336,7 +337,7 @@ export default function App() {
                     <div ref={fuelFillRef} className="h-full rounded-[1px]" style={{ width: "100%", background: "#7ee08a" }} />
                   </div>
                 </div>
-                <span ref={refuelRef} className="font-display text-[10px] text-[#7ee08a] anim-blink shrink-0" style={{ opacity: 0 }}>
+                <span ref={refuelRef} className="font-display text-[10px] text-[#7ee08a] anim-blink shrink-0" style={{ display: "none" }}>
                   ЗАПРАВКА
                 </span>
                 <span ref={lowRef} className="font-display text-[10px] text-[#ff6b5a] anim-blink shrink-0" style={{ display: "none" }}>
@@ -413,6 +414,12 @@ export default function App() {
                   <path d="M4 12h13M13 7l5 5-5 5" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
                 зелёная стрелка у края — направление и метры до работающей АЗС
+              </span>
+              <span className="flex items-center gap-1">
+                <svg viewBox="0 0 24 24" fill="none" className="w-3 h-3 text-[#58c9f3]">
+                  <path d="M4 12h13M13 7l5 5-5 5" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                голубая — до канистры (+10 л к баку)
               </span>
             </div>
           </div>
