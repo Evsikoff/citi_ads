@@ -162,7 +162,7 @@ export default function App() {
             : `Подвезли топливо: новая АЗС в сети — ${active} из ${total}`
         ),
       onStationLock: (active, total) =>
-        showToast(`АЗС израсходована и закрыта. Активных станций: ${active} из ${total}`),
+        showToast(`Колонка занята — АЗС закрылась. Активных станций: ${active} из ${total}`),
       onCanister: (count, liters) =>
         showToast(`Канистра подобрана: бак вырос на ${liters} л. Канистр у тебя: ${count}`),
     });
@@ -646,7 +646,8 @@ export default function App() {
             </h2>
             <p className="mt-3 text-slate-400 leading-relaxed">
               Машина заглохла посреди города. В следующий раз закладывай маршрут до АЗС —
-              оранжевые площадки «ОКТАН» отмечены на миникарте.
+              зелёная стрелка у края экрана всегда показывает направление и метры до
+              работающей колонки, голубая — до канистры.
             </p>
             <div className="mt-6 grid grid-cols-2 gap-3">
               <div className="bg-night-900/80 border border-night-700 rounded-lg py-4">

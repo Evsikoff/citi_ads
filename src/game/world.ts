@@ -10,7 +10,7 @@ const BUILD_INSET = 96; // здания не ближе этой границы 
 const STATION_PAD = 160; // размер площадки АЗС
 const STATION_MARGIN = 30; // отступ площадки от края квартала
 export const CANISTER_R = 20; // радиус канистры (он же радиус подбора)
-const CANISTER_SPREAD = 1400; // канистры не ближе этого друг к другу
+const CANISTER_SPREAD = 1400; // желаемый разброс канистр; ужимается, если их много
 const CANISTER_FROM_START = 900; // и не под колёсами на старте
 
 export interface Rect {
@@ -306,11 +306,16 @@ export function buildCity(clients: Client[], canisterCount = 0, start?: { x: num
     const j = Math.floor(rng() * (i + 1));
     [spots[i], spots[j]] = [spots[j], spots[i]];
   }
-  for (const sp of spots) {
-    if (canisters.length >= canisterCount) break;
-    if (start && Math.hypot(sp.x - start.x, sp.y - start.y) < CANISTER_FROM_START) continue;
-    if (canisters.some((k) => Math.hypot(k.x - sp.x, k.y - sp.y) < CANISTER_SPREAD)) continue;
-    canisters.push({ x: sp.x, y: sp.y, taken: false });
+  // чем больше канистр просят, тем плотнее их приходится класть: начинаем с
+  // желаемого разброса и ужимаем его, пока не разложим требуемое количество
+  for (let spread = CANISTER_SPREAD; canisters.length < canisterCount && spread > 90; spread *= 0.7) {
+    canisters.length = 0;
+    for (const sp of spots) {
+      if (canisters.length >= canisterCount) break;
+      if (start && Math.hypot(sp.x - start.x, sp.y - start.y) < CANISTER_FROM_START) continue;
+      if (canisters.some((k) => Math.hypot(k.x - sp.x, k.y - sp.y) < spread)) continue;
+      canisters.push({ x: sp.x, y: sp.y, taken: false });
+    }
   }
 
   return { blocks, parks, buildings, billboards, trees, lamps, stations, canisters, roadCenters };
