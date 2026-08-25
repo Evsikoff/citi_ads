@@ -87,6 +87,8 @@ export default function App() {
   const refuelPanelRef = useRef<HTMLDivElement>(null);
   const refuelLitersRef = useRef<HTMLSpanElement>(null);
   const canisterCountRef = useRef<HTMLSpanElement>(null);
+  const canisterHudRef = useRef<HTMLSpanElement>(null);
+  const canisterHudCountRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
 
   const [phase, setPhase] = useState<"menu" | "play">("menu");
@@ -137,6 +139,8 @@ export default function App() {
           if (refuelLitersRef.current) refuelLitersRef.current.textContent = `${Math.round(f)} / ${Math.round(fm)} л`;
           if (canisterCountRef.current) canisterCountRef.current.textContent = String(h.canisters);
         }
+        if (canisterHudCountRef.current) canisterHudCountRef.current.textContent = String(h.canisters);
+        if (canisterHudRef.current) canisterHudRef.current.style.opacity = h.canisters ? "1" : "0.45";
         if (lowRef.current) lowRef.current.style.display = !h.refueling && fr < 0.22 && f > 0 ? "inline" : "none";
         if (stationsCountRef.current) {
           const full = h.stationsActive >= h.stationsTotal;
@@ -327,10 +331,23 @@ export default function App() {
                   <FuelIcon />
                 </span>
                 <div className="flex-1 min-w-0">
-                  <div className="flex justify-between items-baseline">
+                  <div className="flex justify-between items-baseline gap-2">
                     <span className="text-[9px] uppercase tracking-[0.2em] text-slate-500 font-semibold">Топливо</span>
-                    <span ref={fuelTextRef} className="font-display text-[11px] text-slate-300 tabular-nums leading-none">
-                      50 л
+                    <span className="flex items-center gap-2 shrink-0">
+                      <span
+                        ref={canisterHudRef}
+                        title="Канистр у тебя"
+                        className="flex items-center gap-0.5 text-[#58c9f3]"
+                        style={{ opacity: 0.45 }}
+                      >
+                        <CanisterIcon className="w-3 h-3" />
+                        <span ref={canisterHudCountRef} className="font-display text-[10px] tabular-nums leading-none">
+                          0
+                        </span>
+                      </span>
+                      <span ref={fuelTextRef} className="font-display text-[11px] text-slate-300 tabular-nums leading-none">
+                        50 л
+                      </span>
                     </span>
                   </div>
                   <div className="h-2.5 mt-1 bg-night-950/80 border border-night-600 rounded-sm overflow-hidden">
