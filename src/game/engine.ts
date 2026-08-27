@@ -78,8 +78,7 @@ interface Skid {
 
 const REV_MAX = 215;
 const MM = 640;
-const BOTS = 10; // ботов-конкурентов в заезде
-const PLAYERS = 1 + BOTS; // участников заезда: игрок и боты
+const PLAYERS = 1 + CONFIG.botCount; // участников заезда: игрок и боты
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
 const CANISTER_L = 10; // на столько литров канистра увеличивает бак
 const REFUEL_RATE = 10; // л/с на работающей АЗС
@@ -250,7 +249,7 @@ export class CityRideGame {
     this.cb = cb;
     this.placeCar();
     this.initStations();
-    this.bots = createBots(this.city, BOTS, START);
+    this.bots = createBots(this.city, CONFIG.botCount, START);
     this.emitLeaderboard();
 
     this.mmBase = document.createElement("canvas");
@@ -351,7 +350,7 @@ export class CityRideGame {
       k.taken = false;
       k.cool = 0;
     }
-    this.bots = createBots(this.city, BOTS, START);
+    this.bots = createBots(this.city, CONFIG.botCount, START);
   }
 
   private placeCar(): void {
@@ -964,7 +963,7 @@ export class CityRideGame {
         this.killPointer(step.took.x, step.took.y, CANISTER_ICON_PATH);
       }
       // бот встал под колонку — она блокируется по тем же правилам, что и у игрока,
-      // но без сообщений игроку: десять ботов иначе завалят экран тостами
+      // но без сообщений игроку: боты иначе завалят экран тостами
       if (step.soldAt) {
         for (let i = 0; i < 10; i++) {
           this.spawn(step.soldAt.x, step.soldAt.y, "confetti", i % 2 ? "#ffd27a" : BASE_ACCENT, 0.8, 200);
@@ -2348,7 +2347,7 @@ export class CityRideGame {
     this.paintHeadlights(c.x, c.y, c.angle, 235, 0.3);
     for (const b of this.bots) {
       if (!inView({ x: b.x - 160, y: b.y - 160, w: 320, h: 320 }, vis)) continue;
-      // фары ботов короче и тусклее — десять машин иначе засветят весь квартал
+      // фары ботов короче и тусклее — множество машин иначе засветит весь квартал
       this.paintHeadlights(b.x, b.y, b.angle, 150, 0.16);
     }
     const hx = Math.cos(c.angle);
