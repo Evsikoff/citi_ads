@@ -8,6 +8,7 @@ import { sfx } from "./game/audio";
 import { CONFIG } from "./game/config";
 import {
   BOOSTER_MENU_ITEMS,
+  GAME_OVER_BOOSTERS,
   INACTIVE_STATION_BOOSTERS,
   calculateBoosterCost,
   executeExternalBoosterSale,
@@ -1115,7 +1116,7 @@ export default function App() {
       {gameover && (
         <div className="absolute inset-0 z-30 flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-[rgba(5,8,16,0.74)] anim-fade" />
-          <div className="relative bg-night-800 border border-[#5a2c24] rounded-xl p-8 max-w-md w-full text-center anim-pop shadow-[0_30px_90px_rgba(0,0,0,0.65)]">
+          <div className="relative max-h-[calc(100vh-2rem)] w-full max-w-md overflow-y-auto rounded-xl border border-[#5a2c24] bg-night-800 p-8 text-center shadow-[0_30px_90px_rgba(0,0,0,0.65)] anim-pop">
             <div className="flex justify-center text-[#ff6b5a]">
               <FuelIcon className="w-10 h-10" />
             </div>
@@ -1140,6 +1141,82 @@ export default function App() {
                 <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mt-1">время в пути</div>
               </div>
             </div>
+
+            {GAME_OVER_BOOSTERS.length > 0 && (
+              <div className="mt-6 text-left">
+                <div className="mb-2 px-1 font-display text-[11px] tracking-[0.14em] text-[#f2ecdf]">
+                  БУСТЕРЫ
+                </div>
+                <div className="flex flex-col gap-2">
+                  {GAME_OVER_BOOSTERS.map((booster) => {
+                    const purchased = boosterPurchases[booster.id] ?? 0;
+                    const maximum = getMaximumPurchases(booster);
+                    const cost = calculateBoosterCost(booster, CONFIG.startMoney);
+                    const available = isBoosterAvailable(
+                      booster,
+                      boosterPurchases,
+                      boosterBalance,
+                      CONFIG.startMoney
+                    );
+                    const parent = booster.parent_booster
+                      ? BOOSTER_MENU_ITEMS.find((item) => item.id === booster.parent_booster)
+                      : undefined;
+
+                    let status: string;
+                    if (purchased >= maximum) {
+                      status = "Лимит исчерпан";
+                    } else if (parent && (boosterPurchases[parent.id] ?? 0) < 1) {
+                      status = `Сначала: ${formatBoosterName(parent.name, CONFIG.startMoney)}`;
+                    } else if (booster.sales_method === "In-game currency") {
+                      status = !Number.isFinite(cost)
+                        ? "Цена не настроена"
+                        : boosterBalance >= cost
+                          ? `${fmtMoney(cost)} ₽`
+                          : `Не хватает ${fmtMoney(cost - boosterBalance)} ₽`;
+                    } else if (booster.sales_method === "In-app purchase") {
+                      status = "Покупка в приложении · заглушка";
+                    } else if (booster.sales_method === "Video advertising") {
+                      status = "Просмотр рекламы · заглушка";
+                    } else {
+                      status = `${booster.sales_method} · заглушка`;
+                    }
+
+                    return (
+                      <button
+                        key={booster.id}
+                        type="button"
+                        disabled={!available}
+                        onClick={() => buyBooster(booster)}
+                        className="group/gameover-booster flex min-h-[66px] w-full items-center gap-3 rounded-lg border border-night-600 bg-night-900/80 p-2 text-left shadow-[0_7px_18px_rgba(0,0,0,0.28)] transition-all enabled:hover:-translate-y-0.5 enabled:hover:border-[#ff8a72]/70 enabled:hover:bg-[#182238] enabled:active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-45"
+                      >
+                        <img
+                          src={getBoosterIcon(booster.icon_filename)}
+                          alt=""
+                          className="h-12 w-12 shrink-0 rounded-lg border border-night-600 object-cover shadow-inner"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex items-center gap-1.5 font-display text-sm leading-tight text-[#f2ecdf]">
+                            <span>{formatBoosterName(booster.name, CONFIG.startMoney)}</span>
+                            {booster.sales_method === "Video advertising" && (
+                              <span role="img" aria-label="Видео-реклама" title="Видео-реклама">
+                                🎥
+                              </span>
+                            )}
+                          </span>
+                          <span className="mt-1 block text-[10px] leading-tight text-slate-500">
+                            {status}
+                          </span>
+                        </span>
+                        <span className="shrink-0 self-start rounded bg-night-950/70 px-1.5 py-1 text-[9px] tabular-nums text-slate-500">
+                          {purchased}/{maximum}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             <button
               onClick={restart}
               className="mt-7 w-full rounded-md bg-[#ff6b5a] text-night-950 font-display text-sm tracking-wide px-6 py-4 hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 shadow-[0_8px_24px_rgba(255,107,90,0.35)]"

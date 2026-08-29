@@ -36,6 +36,10 @@ export const INACTIVE_STATION_BOOSTERS = BOOSTERS.filter(
   (booster) => booster.display_method === "Next to an inactive gas station"
 );
 
+export const GAME_OVER_BOOSTERS = BOOSTERS.filter(
+  (booster) => booster.display_method === "Game Over Screen and Booster menu"
+);
+
 /**
  * Вычисляет безопасное арифметическое выражение с числами, S, скобками и
  * операторами +, -, *, /. Никакой произвольный JavaScript здесь не исполняется.
