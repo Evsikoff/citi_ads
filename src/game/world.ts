@@ -21,6 +21,8 @@ const CANISTER_SPREAD = 1400; // желаемый разброс канистр;
 const CANISTER_FROM_START = 900; // и не под колёсами на старте
 
 export interface Rect {
+  /** Стабильный серверный id. В локальном режиме объектам он не нужен. */
+  id?: string;
   x: number;
   y: number;
   w: number;
@@ -40,15 +42,19 @@ export interface Billboard extends Rect {
   state: "ready" | "done";
   cooldown: number; // секунд до возврата из done в ready
   vertical: boolean;
+  /** Игроки, уже активировавшие щит; присутствует в сетевом снимке. */
+  discoveredBy?: string[];
 }
 
 export interface Tree {
+  id?: string;
   x: number;
   y: number;
   r: number;
 }
 
 export interface Lamp {
+  id?: string;
   x: number;
   y: number;
 }
@@ -80,6 +86,7 @@ export interface Base extends Rect {
 
 /** канистра: лежит на проезжей части, наезд = подбор */
 export interface Canister {
+  id?: string;
   x: number;
   y: number;
   taken: boolean;
