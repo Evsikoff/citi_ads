@@ -492,9 +492,20 @@ export default function App() {
                   id="boosters-menu"
                   className="anim-pop absolute left-0 top-[calc(100%+8px)] w-[min(360px,calc(100vw-2rem))] max-h-[min(70vh,580px)] overflow-y-auto rounded-xl border border-night-600 bg-night-900/95 p-2 shadow-[0_24px_70px_rgba(0,0,0,0.72)] backdrop-blur-md"
                 >
-                  <div className="px-2 pb-2 pt-1">
-                    <div className="font-display text-[11px] tracking-[0.14em] text-[#f2ecdf]">
-                      УЛУЧШЕНИЯ
+                  <div className="sticky top-0 z-10 mb-2 rounded-lg border border-night-700 bg-night-900/95 px-3 py-2 shadow-[0_6px_16px_rgba(0,0,0,0.28)] backdrop-blur-md">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="font-display text-[11px] tracking-[0.14em] text-[#f2ecdf]">
+                        УЛУЧШЕНИЯ
+                      </div>
+                      <div
+                        className="flex shrink-0 items-center gap-1.5 rounded-md border border-[#ffd27a]/25 bg-[#ffd27a]/10 px-2 py-1 text-[#ffd27a]"
+                        aria-label={`Баланс: ${fmtMoney(boosterBalance)} ₽`}
+                      >
+                        <MoneyIcon className="h-3.5 w-3.5" />
+                        <span className="font-display text-xs tabular-nums">
+                          {fmtMoney(boosterBalance)} ₽
+                        </span>
+                      </div>
                     </div>
                     <div className="mt-1 text-[10px] leading-snug text-slate-500">
                       Покупки и зависимости действуют до конца текущего заезда.
