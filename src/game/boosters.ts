@@ -26,8 +26,14 @@ const MENU_DISPLAY_METHODS = new Set([
   "Game Over Screen and Booster menu",
 ]);
 
-export const BOOSTER_MENU_ITEMS = (boosterData as Booster[]).filter((booster) =>
+const BOOSTERS = boosterData as Booster[];
+
+export const BOOSTER_MENU_ITEMS = BOOSTERS.filter((booster) =>
   MENU_DISPLAY_METHODS.has(booster.display_method)
+);
+
+export const INACTIVE_STATION_BOOSTERS = BOOSTERS.filter(
+  (booster) => booster.display_method === "Next to an inactive gas station"
 );
 
 /**
@@ -122,13 +128,20 @@ export function getMaximumPurchases(booster: Booster): number {
   return Number.isFinite(maximum) ? Math.max(0, maximum) : 0;
 }
 
+export function isBoosterWithinSessionLimit(
+  booster: Booster,
+  purchases: BoosterPurchaseCounts
+): boolean {
+  return (purchases[booster.id] ?? 0) < getMaximumPurchases(booster);
+}
+
 export function isBoosterAvailable(
   booster: Booster,
   purchases: BoosterPurchaseCounts,
   balance: number,
   startMoney: number
 ): boolean {
-  if ((purchases[booster.id] ?? 0) >= getMaximumPurchases(booster)) return false;
+  if (!isBoosterWithinSessionLimit(booster, purchases)) return false;
   if (booster.parent_booster && (purchases[booster.parent_booster] ?? 0) < 1) return false;
   if (booster.sales_method === "In-game currency") {
     return balance >= calculateBoosterCost(booster, startMoney);

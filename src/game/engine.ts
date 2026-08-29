@@ -45,6 +45,7 @@ export interface GameCallbacks {
   onBillboardUnavailable(): void;
   onStationUnlock(active: number, total: number, origin: "timer" | "ad"): void;
   onStationLock(active: number, total: number): void;
+  onInactiveStationNearby(nearby: boolean): void;
   onCanister(count: number, liters: number): void;
   onCanisterLost(count: number, left: number): void;
   /** заправка прервалась не из-за полного бака */
@@ -82,6 +83,7 @@ const PLAYERS = 1 + CONFIG.botCount; // участников заезда: иг�
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
 const CANISTER_L = 10; // на столько литров канистра увеличивает бак
 const REFUEL_RATE = 10; // л/с на работающей АЗС
+const INACTIVE_STATION_PROXIMITY = 120; // расстояние от края площадки для показа контекстного бустера
 // T = базовый таймаут + надбавка за каждую канистру, оба значения из config.ts
 const M_PER_PX = 0.35; // метров в мировом пикселе — для подписей с дистанцией
 
@@ -209,6 +211,7 @@ export class CityRideGame {
   private stationsActive = 0;
   private refuelStation: Station | null = null; // где сейчас идёт заправка
   private usedStation: Station | null = null; // площадка, с которой ещё не съехали после заправки
+  private nearbyInactiveStation: Station | null = null;
   // очередь отложенных открытий: каждая занятая колонка через T секунд открывает другую
   private unlockQueue: Array<{ t: number; from: Station; notify: boolean }> = [];
   private bots: Bot[] = [];
@@ -308,6 +311,18 @@ export class CityRideGame {
     return true;
   }
 
+  /** Активирует именно ту закрытую АЗС, рядом с которой сейчас находится игрок. */
+  activateNearbyInactiveStation(): boolean {
+    const station = this.nearbyInactiveStation;
+    if (!station || station.state !== "locked") {
+      this.updateNearbyInactiveStation();
+      return false;
+    }
+    const activated = this.activateStation(station, "ad", true);
+    if (activated) this.setNearbyInactiveStation(null);
+    return activated;
+  }
+
   reset(): void {
     for (const b of this.city.billboards) {
       b.discovered = false;
@@ -354,6 +369,7 @@ export class CityRideGame {
     this.refueling = false;
     this.refuelStation = null;
     this.usedStation = null;
+    this.setNearbyInactiveStation(null);
     this.unlockQueue = [];
     this.knock.x = 0;
     this.knock.y = 0;
@@ -495,6 +511,7 @@ export class CityRideGame {
       c.speed = 0;
       this.braking = false;
       this.prevWheelL = this.prevWheelR = null;
+      this.updateNearbyInactiveStation();
       this.displaySpeed += (0 - this.displaySpeed) * Math.min(1, 8 * dt);
       this.updateFuel(dt);
       this.updateBots(dt);
@@ -603,6 +620,7 @@ export class CityRideGame {
     this.carCollisions(dt);
     this.coolCanisters(dt);
     this.pickCanisters();
+    this.updateNearbyInactiveStation();
     this.updateParticles(dt);
     this.fadeSkids(dt);
 
@@ -1181,19 +1199,51 @@ export class CityRideGame {
     }
   }
 
-  /** открыть случайную АЗС из закрытых (по таймеру или за просмотр рекламы) */
-  private unlockRandom(origin: "timer" | "ad", notify = true, exclude: Station | null = null): void {
-    let locked = this.city.stations.filter((x) => x.state === "locked");
-    // «другая случайная»: ту же колонку не открываем, если есть из чего выбрать
-    if (exclude && locked.some((x) => x !== exclude)) locked = locked.filter((x) => x !== exclude);
-    if (!locked.length) return;
-    const st = locked[Math.floor(Math.random() * locked.length)];
-    st.state = "active";
-    st.origin = origin;
-    this.rollStationOffer(st);
+  private setNearbyInactiveStation(station: Station | null): void {
+    if (this.nearbyInactiveStation === station) return;
+    this.nearbyInactiveStation = station;
+    this.cb.onInactiveStationNearby(station !== null);
+  }
+
+  private updateNearbyInactiveStation(): void {
+    if (this.refueling) {
+      this.setNearbyInactiveStation(null);
+      return;
+    }
+
+    let nearest: Station | null = null;
+    let nearestDistance = INACTIVE_STATION_PROXIMITY;
+    for (const station of this.city.stations) {
+      if (
+        station.state !== "locked" ||
+        station === this.refuelStation ||
+        station === this.usedStation
+      ) {
+        continue;
+      }
+      const closestX = clamp(this.car.x, station.x, station.x + station.w);
+      const closestY = clamp(this.car.y, station.y, station.y + station.h);
+      const distance = Math.hypot(this.car.x - closestX, this.car.y - closestY);
+      if (distance <= nearestDistance) {
+        nearestDistance = distance;
+        nearest = station;
+      }
+    }
+    this.setNearbyInactiveStation(nearest);
+  }
+
+  private activateStation(
+    station: Station,
+    origin: "timer" | "ad",
+    notify: boolean
+  ): boolean {
+    if (station.state !== "locked") return false;
+    station.state = "active";
+    station.origin = origin;
+    this.rollStationOffer(station);
     this.stationsActive += 1;
-    const cx = st.x + st.w / 2;
-    const cy = st.y + st.h / 2;
+    const cx = station.x + station.w / 2;
+    const cy = station.y + station.h / 2;
     for (let i = 0; i < 18; i++) {
       this.spawn(cx, cy, "spark", i % 2 ? "#ffd27a" : "#7ee08a", 0.8, 260);
     }
@@ -1201,6 +1251,17 @@ export class CityRideGame {
       sfx.unlock();
       this.cb.onStationUnlock(this.stationsActive, this.city.stations.length, origin);
     }
+    return true;
+  }
+
+  /** открыть случайную АЗС из закрытых (по таймеру или за просмотр рекламы) */
+  private unlockRandom(origin: "timer" | "ad", notify = true, exclude: Station | null = null): void {
+    let locked = this.city.stations.filter((x) => x.state === "locked");
+    // «другая случайная»: ту же колонку не открываем, если есть из чего выбрать
+    if (exclude && locked.some((x) => x !== exclude)) locked = locked.filter((x) => x !== exclude);
+    if (!locked.length) return;
+    const st = locked[Math.floor(Math.random() * locked.length)];
+    this.activateStation(st, origin, notify);
   }
 
   private pushSkid(a: { x: number; y: number }, b: { x: number; y: number }): void {

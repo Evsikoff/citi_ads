@@ -8,11 +8,13 @@ import { sfx } from "./game/audio";
 import { CONFIG } from "./game/config";
 import {
   BOOSTER_MENU_ITEMS,
+  INACTIVE_STATION_BOOSTERS,
   calculateBoosterCost,
   executeExternalBoosterSale,
   formatBoosterName,
   getMaximumPurchases,
   isBoosterAvailable,
+  isBoosterWithinSessionLimit,
 } from "./game/boosters";
 import type { Booster } from "./game/boosters";
 import { ClientModal } from "./components/ClientModal";
@@ -150,6 +152,7 @@ export default function App() {
   const [boostersOpen, setBoostersOpen] = useState(false);
   const [boosterBalance, setBoosterBalance] = useState(CONFIG.startMoney);
   const [boosterPurchases, setBoosterPurchases] = useState<Record<string, number>>({});
+  const [inactiveStationNearby, setInactiveStationNearby] = useState(false);
   const [touch] = useState(
     () => typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches
   );
@@ -223,6 +226,7 @@ export default function App() {
         ),
       onStationLock: (active, total) =>
         showToast(`Колонка занята — АЗС закрылась. Активных станций: ${active} из ${total}`),
+      onInactiveStationNearby: setInactiveStationNearby,
       onCanister: (count, liters) =>
         showToast(`Канистра подобрана: бак вырос на ${liters} л (топливо не прибавилось). Канистр у тебя: ${count}`),
       onRefuelStop: (reason) =>
@@ -272,6 +276,7 @@ export default function App() {
     setBoostersOpen(false);
     setBoosterBalance(CONFIG.startMoney);
     setBoosterPurchases({});
+    setInactiveStationNearby(false);
     setPhase("play");
   };
 
@@ -285,6 +290,7 @@ export default function App() {
     setBoostersOpen(false);
     setBoosterBalance(CONFIG.startMoney);
     setBoosterPurchases({});
+    setInactiveStationNearby(false);
     showToast("Новая охота: билборды снова доступны, бак полный");
   };
 
@@ -311,6 +317,25 @@ export default function App() {
     showToast(`${formatBoosterName(booster.name, CONFIG.startMoney)} — получено`);
   };
 
+  const activateInactiveStationBooster = (booster: Booster) => {
+    if (
+      !inactiveStationNearby ||
+      !isBoosterWithinSessionLimit(booster, boosterPurchases)
+    ) {
+      return;
+    }
+    if (!executeExternalBoosterSale(booster)) {
+      showToast("Не удалось выполнить действие — попробуй ещё раз");
+      return;
+    }
+    if (!gameRef.current?.activateNearbyInactiveStation()) return;
+
+    setBoosterPurchases((current) => ({
+      ...current,
+      [booster.id]: (current[booster.id] ?? 0) + 1,
+    }));
+  };
+
   const toggleMute = () => {
     setMuted((m) => {
       sfx.setMuted(!m);
@@ -333,6 +358,21 @@ export default function App() {
         e.preventDefault();
         setMapOpen((open) => !open);
       }
+      if (
+        e.code === "KeyE" &&
+        !e.repeat &&
+        phase === "play" &&
+        inactiveStationNearby &&
+        INACTIVE_STATION_BOOSTERS.length === 1 &&
+        !modal &&
+        !sell &&
+        !win &&
+        !gameover &&
+        !mapOpen
+      ) {
+        e.preventDefault();
+        activateInactiveStationBooster(INACTIVE_STATION_BOOSTERS[0]);
+      }
       if (e.code === "KeyV") toggleMute();
       if (e.code === "Escape") {
         if (boostersOpen) setBoostersOpen(false);
@@ -344,7 +384,17 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, modal, sell, win, gameover, mapOpen, boostersOpen]);
+  }, [
+    phase,
+    modal,
+    sell,
+    win,
+    gameover,
+    mapOpen,
+    boostersOpen,
+    inactiveStationNearby,
+    boosterPurchases,
+  ]);
 
   const hold = (k: "up" | "down" | "left" | "right") => ({
     onPointerDown: (e: ReactPointerEvent) => {
@@ -616,6 +666,64 @@ export default function App() {
                 <SpeakerIcon muted={muted} />
               </button>
           </div>
+
+          {/* контекстные бустеры рядом с закрытой АЗС */}
+          {inactiveStationNearby && INACTIVE_STATION_BOOSTERS.length > 0 && (
+            <div className="pointer-events-auto absolute left-1/2 top-4 z-20 w-[min(380px,calc(100vw-2rem))] -translate-x-1/2">
+              <div className="anim-pop rounded-xl border border-[#d0604e]/45 bg-night-900/95 p-2 shadow-[0_20px_55px_rgba(0,0,0,0.62)] backdrop-blur-md">
+                <div className="flex items-center justify-between gap-3 px-2 pb-2 pt-1">
+                  <div>
+                    <div className="font-display text-[11px] tracking-[0.12em] text-[#ff8a72]">
+                      НА АЗС НЕТ ТОПЛИВА
+                    </div>
+                    <div className="mt-0.5 text-[10px] text-slate-500">
+                      Можно активировать эту заправку
+                    </div>
+                  </div>
+                  {INACTIVE_STATION_BOOSTERS.length === 1 &&
+                    isBoosterWithinSessionLimit(
+                      INACTIVE_STATION_BOOSTERS[0],
+                      boosterPurchases
+                    ) && <span className="kbd shrink-0">E</span>}
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  {INACTIVE_STATION_BOOSTERS.map((booster) => {
+                    const purchased = boosterPurchases[booster.id] ?? 0;
+                    const maximum = getMaximumPurchases(booster);
+                    const available = isBoosterWithinSessionLimit(booster, boosterPurchases);
+
+                    return (
+                      <button
+                        key={booster.id}
+                        type="button"
+                        disabled={!available}
+                        onClick={() => activateInactiveStationBooster(booster)}
+                        className="group/station-booster flex min-h-[66px] w-full items-center gap-3 rounded-lg border border-night-600 bg-night-800/95 p-2 text-left shadow-[0_7px_18px_rgba(0,0,0,0.28)] transition-all enabled:hover:-translate-y-0.5 enabled:hover:border-[#ff8a72]/70 enabled:hover:bg-[#182238] enabled:active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-45"
+                      >
+                        <img
+                          src={getBoosterIcon(booster.icon_filename)}
+                          alt=""
+                          className="h-12 w-12 shrink-0 rounded-lg border border-night-600 object-cover shadow-inner"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block font-display text-sm leading-tight text-[#f2ecdf]">
+                            {formatBoosterName(booster.name, CONFIG.startMoney)}
+                          </span>
+                          <span className="mt-1 block text-[10px] leading-tight text-slate-500">
+                            {available ? "Просмотреть рекламу" : "Лимит исчерпан"}
+                          </span>
+                        </span>
+                        <span className="shrink-0 self-start rounded bg-night-950/70 px-1.5 py-1 text-[9px] tabular-nums text-slate-500">
+                          {purchased}/{maximum}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* центр сверху: панель заправки (управление на это время заблокировано) */}
           <div
