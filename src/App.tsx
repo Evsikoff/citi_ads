@@ -310,6 +310,21 @@ export default function App() {
     <div className="fixed inset-0 overflow-hidden bg-night-900 no-select text-slate-200">
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
 
+      {/* Кнопка "Прокачка" в левом верхнем углу */}
+      <div className="absolute left-4 top-4 z-50 flex items-center gap-2">
+        <button
+          className="flex h-12 w-12 items-center justify-center rounded-lg border border-night-600 bg-night-800/80 transition-colors hover:border-amber-glow hover:bg-night-700"
+          aria-label="Прокачка"
+        >
+          <img
+            src="src/images/boosters/boosters.png"
+            alt=""
+            className="h-8 w-8 object-contain"
+          />
+        </button>
+        <span className="font-display text-sm tracking-wider text-[#f2ecdf]">ПРОКАЧКА</span>
+      </div>
+
       {/* canvas карты всегда смонтирован, чтобы игровой движок мог обновлять его */}
       <div
         className={`absolute inset-0 z-[60] items-center justify-center bg-[rgba(4,7,14,0.88)] p-4 backdrop-blur-sm ${
