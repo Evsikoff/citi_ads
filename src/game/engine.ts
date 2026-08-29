@@ -88,8 +88,28 @@ interface Skid {
   a: number;
 }
 
+/**
+ * Чужая машина в онлайне: `bot` — то, что реально рисуется и едет плавно,
+ * остальные поля — последняя серверная цель, к которой его подтягиваем.
+ */
+interface RemoteEntity {
+  bot: Bot;
+  x: number;
+  y: number;
+  angle: number;
+  speed: number;
+  age: number; // сколько секунд прошло с последнего снапшота
+}
+
 const REV_MAX = 215;
 const MM = 640;
+// Онлайн: движение машины считается локально каждый кадр, а серверные снапшоты
+// вливаются в картинку плавно — иначе машина дёргается на каждом пакете.
+const RECONCILE_RATE = 7; // насколько быстро гасим расхождение с сервером, 1/с
+const RECONCILE_SNAP = 220; // расхождение больше — сразу ставим машину на место сервера
+const REMOTE_SMOOTH_RATE = 12; // с какой скоростью чужие машины подтягиваются к цели
+const REMOTE_SNAP = 260; // расхождение больше — телепорт вместо догонялок
+const REMOTE_EXTRAPOLATE_S = 0.35; // сколько продлеваем чужое движение без новых данных
 const PLAYERS = 1 + CONFIG.botCount; // участников заезда: игрок и боты
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
 const CANISTER_L = 10; // на столько литров канистра увеличивает бак
@@ -99,6 +119,14 @@ const INACTIVE_STATION_PROXIMITY = 120; // расстояние от края п
 const M_PER_PX = 0.35; // метров в мировом пикселе — для подписей с дистанцией
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+
+/** кратчайший поворот от одного угла к другому, в диапазоне (-π, π] */
+function angleDelta(to: number, from: number): number {
+  let d = (to - from) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
 
 const PLAYER_COLOR = "#e5472f"; // машина игрока — единственная красная
 
@@ -247,6 +275,11 @@ export class CityRideGame {
   private onlineInputCd = 0;
   private onlineContacts = new Set<string>();
   private onlinePlayerStatus = "active";
+  // Расхождение предсказанной машины с последним состоянием сервера. Не
+  // применяется рывком: reconcilePrediction() размазывает его по кадрам.
+  private serverError = { x: 0, y: 0, angle: 0, speed: 0 };
+  // Чужие машины и боты: отрисовка отдельно от того, что прислал сервер.
+  private remoteEntities = new Map<string, RemoteEntity>();
 
   private onKeyDown: (e: KeyboardEvent) => void;
   private onKeyUp: (e: KeyboardEvent) => void;
@@ -338,6 +371,8 @@ export class CityRideGame {
     this.online = transport;
     this.onlineInputCd = 0;
     this.onlineContacts.clear();
+    this.remoteEntities.clear();
+    this.resetServerError();
     if (!transport) {
       this.onlinePlayerId = null;
       this.onlinePlayerStatus = "active";
@@ -346,7 +381,7 @@ export class CityRideGame {
 
   setOnlinePlayer(playerId: string, player: PublicPlayerState): void {
     this.onlinePlayerId = playerId;
-    this.applyServerPlayer(player);
+    this.applyServerPlayer(player, "snap");
   }
 
   applyWorldSnapshot(
@@ -371,7 +406,56 @@ export class CityRideGame {
         (player) => player.id !== this.onlinePlayerId && player.status === "active"
       ),
     ];
-    this.bots = others.map((entity) => this.toRenderBot(entity));
+    this.syncRemoteEntities(others);
+  }
+
+  /**
+   * Серверные координаты чужих машин кладём в цель, а нарисованное положение
+   * оставляем прежним: до неё машина доедет за несколько кадров в
+   * updateRemoteEntities(). Иначе каждый снапшот выглядит как телепорт.
+   */
+  private syncRemoteEntities(entities: RemoteEntityState[]): void {
+    const next = new Map<string, RemoteEntity>();
+    for (const entity of entities) {
+      const bot = this.toRenderBot(entity);
+      const known = this.remoteEntities.get(entity.id);
+      if (known && Math.hypot(entity.x - known.bot.x, entity.y - known.bot.y) <= REMOTE_SNAP) {
+        bot.x = known.bot.x;
+        bot.y = known.bot.y;
+        bot.angle = known.bot.angle;
+        bot.speed = known.bot.speed;
+      }
+      next.set(entity.id, {
+        bot,
+        x: entity.x,
+        y: entity.y,
+        angle: entity.angle,
+        speed: entity.speed,
+        age: 0,
+      });
+    }
+    this.remoteEntities = next;
+    this.bots = [...next.values()].map((entity) => entity.bot);
+  }
+
+  /**
+   * Между снапшотами чужие машины продолжают ехать сами по последней скорости,
+   * а отрисовка плавно догоняет цель.
+   */
+  private updateRemoteEntities(dt: number): void {
+    const k = 1 - Math.exp(-REMOTE_SMOOTH_RATE * dt);
+    for (const entity of this.remoteEntities.values()) {
+      entity.age += dt;
+      if (entity.age < REMOTE_EXTRAPOLATE_S) {
+        entity.x += Math.cos(entity.angle) * entity.speed * dt;
+        entity.y += Math.sin(entity.angle) * entity.speed * dt;
+      }
+      const bot = entity.bot;
+      bot.x += (entity.x - bot.x) * k;
+      bot.y += (entity.y - bot.y) * k;
+      bot.angle += angleDelta(entity.angle, bot.angle) * k;
+      bot.speed += (entity.speed - bot.speed) * k;
+    }
   }
 
   applyWorldObjects(objects: WorldObjects): void {
@@ -405,7 +489,7 @@ export class CityRideGame {
     this.gameOverSent = false;
     this.stalled = false;
     this.onlinePlayerStatus = "active";
-    this.applyServerPlayer(player);
+    this.applyServerPlayer(player, "snap");
   }
 
   requestOnlineRespawn(): boolean {
@@ -548,7 +632,10 @@ export class CityRideGame {
     this.updateNearbyInactiveStation();
   }
 
-  private applyServerPlayer(player: PublicPlayerState): void {
+  private applyServerPlayer(
+    player: PublicPlayerState,
+    mode: "reconcile" | "snap" = "reconcile"
+  ): void {
     if (this.onlinePlayerId && player.id !== this.onlinePlayerId) return;
 
     const oldFuel = this.fuel;
@@ -556,10 +643,7 @@ export class CityRideGame {
     const fuelAdded = Math.max(0, player.fuel - oldFuel);
 
     this.playerName = player.name;
-    this.car.x = player.x;
-    this.car.y = player.y;
-    this.car.angle = player.angle;
-    this.car.speed = player.speed;
+    this.applyServerPosition(player, mode);
     this.fuel = player.fuel;
     this.fuelMax = player.tankVolume;
     this.money = player.money;
@@ -596,6 +680,65 @@ export class CityRideGame {
       this.gameOverSent = false;
     }
     this.emitHud();
+  }
+
+  /**
+   * Кладёт серверное положение на машину игрока. Пока работает локальное
+   * предсказание, разницу не применяем сразу, а копим в serverError: её
+   * равномерно размажет по кадрам reconcilePrediction(), поэтому коррекция не
+   * видна как рывок. Мгновенно двигаем машину только там, где предсказывать
+   * нечего: вход в игру, респавн, гибель и совсем уж большое расхождение.
+   */
+  private applyServerPosition(player: PublicPlayerState, mode: "reconcile" | "snap"): void {
+    const c = this.car;
+    const predicting =
+      mode === "reconcile" &&
+      this.phase === "play" &&
+      player.status === "active" &&
+      !!this.online?.connected;
+    const drift = Math.hypot(player.x - c.x, player.y - c.y);
+
+    if (!predicting || drift > RECONCILE_SNAP) {
+      c.x = player.x;
+      c.y = player.y;
+      c.angle = player.angle;
+      c.speed = player.speed;
+      this.resetServerError();
+      return;
+    }
+
+    this.serverError.x = player.x - c.x;
+    this.serverError.y = player.y - c.y;
+    this.serverError.angle = angleDelta(player.angle, c.angle);
+    this.serverError.speed = player.speed - c.speed;
+  }
+
+  /** гасит накопленное расхождение с сервером понемногу каждый кадр */
+  private reconcilePrediction(dt: number): void {
+    const e = this.serverError;
+    if (!e.x && !e.y && !e.angle && !e.speed) return;
+
+    const k = 1 - Math.exp(-RECONCILE_RATE * dt);
+    this.car.x += e.x * k;
+    this.car.y += e.y * k;
+    this.car.angle += e.angle * k;
+    this.car.speed += e.speed * k;
+    e.x -= e.x * k;
+    e.y -= e.y * k;
+    e.angle -= e.angle * k;
+    e.speed -= e.speed * k;
+
+    if (Math.abs(e.x) < 0.05) e.x = 0;
+    if (Math.abs(e.y) < 0.05) e.y = 0;
+    if (Math.abs(e.angle) < 0.0005) e.angle = 0;
+    if (Math.abs(e.speed) < 0.5) e.speed = 0;
+  }
+
+  private resetServerError(): void {
+    this.serverError.x = 0;
+    this.serverError.y = 0;
+    this.serverError.angle = 0;
+    this.serverError.speed = 0;
   }
 
   private toRenderBot(entity: RemoteEntityState): Bot {
@@ -772,6 +915,12 @@ export class CityRideGame {
       // окно клиента или карта и основная симуляция поставлена на паузу.
       if (!this.online) this.updateBillboards(dt);
       if (!this.paused) this.update(dt);
+      // Серверные данные вливаются в картинку каждый кадр — в том числе на
+      // паузе, когда своё предсказание не крутится.
+      if (this.online?.connected) {
+        this.reconcilePrediction(dt);
+        this.updateRemoteEntities(dt);
+      }
     }
     this.render(dt);
   };
@@ -809,8 +958,19 @@ export class CityRideGame {
       this.onlineInputCd = 1 / 30;
     }
 
+    // Движение считаем сами, кадр в кадр: сеть нужна лишь для того, чтобы
+    // время от времени поправить результат — это делает reconcilePrediction().
+    let throttle = 0;
+    if (this.refueling || this.onlinePlayerStatus !== "active") {
+      // под колонкой и после вылета машина стоит: предсказывать нечего
+      this.car.speed = 0;
+      this.braking = false;
+      this.prevWheelL = this.prevWheelR = null;
+    } else {
+      throttle = this.stepCar(dt, false);
+    }
+
     const speed = Math.abs(this.car.speed);
-    this.braking = down || handbrake;
     this.displaySpeed += (speed - this.displaySpeed) * Math.min(1, 10 * dt);
     this.topSpeed = Math.max(this.topSpeed, speed);
     this.updateParticles(dt);
@@ -821,7 +981,7 @@ export class CityRideGame {
     if (this.stalled || this.onlinePlayerStatus !== "active") {
       sfx.engineIdle();
     } else {
-      sfx.engine(speed / this.getPlayerMaxSpeed(), up ? 1 : down ? 0.5 : 0);
+      sfx.engine(speed / this.getPlayerMaxSpeed(), throttle);
     }
 
     if (
@@ -927,6 +1087,37 @@ export class CityRideGame {
       return;
     }
 
+    const throttle = this.stepCar(dt, true);
+
+    this.checkBase();
+    this.updateFuel(dt);
+    this.updateBots(dt);
+    this.carCollisions(dt);
+    this.coolCanisters(dt);
+    this.pickCanisters();
+    this.updateNearbyInactiveStation();
+    this.updateParticles(dt);
+    this.fadeSkids(dt);
+
+    const sp = Math.abs(c.speed);
+    this.topSpeed = Math.max(this.topSpeed, sp);
+    this.displaySpeed += (sp - this.displaySpeed) * Math.min(1, 8 * dt);
+
+    if (this.stalled) sfx.engineIdle();
+    else sfx.engine(sp / maxSpeed, throttle);
+    this.maybeEmitLeaderboard();
+    this.emitHud();
+  }
+
+  /**
+   * Физика кузова игрока за кадр: газ, тормоз, руль, снос на траве, следы юза и
+   * упор в стены. В онлайне это же и есть локальное предсказание — движение
+   * рисуется сразу, не дожидаясь снапшота, а расхождение потом гасит
+   * reconcilePrediction(). Возвращает текущую «долю газа» для звука мотора.
+   */
+  private stepCar(dt: number, interactive: boolean): number {
+    const c = this.car;
+    const maxSpeed = this.getPlayerMaxSpeed();
     const up = this.keys.has("up");
     const down = this.keys.has("down");
     const left = this.keys.has("left");
@@ -1015,24 +1206,8 @@ export class CityRideGame {
     }
 
     this.applyKnock(dt);
-    this.collide();
-    this.checkBase();
-    this.updateFuel(dt);
-    this.updateBots(dt);
-    this.carCollisions(dt);
-    this.coolCanisters(dt);
-    this.pickCanisters();
-    this.updateNearbyInactiveStation();
-    this.updateParticles(dt);
-    this.fadeSkids(dt);
-
-    this.topSpeed = Math.max(this.topSpeed, sp);
-    this.displaySpeed += (sp - this.displaySpeed) * Math.min(1, 8 * dt);
-
-    if (this.stalled) sfx.engineIdle();
-    else sfx.engine(sp / maxSpeed, throttle);
-    this.maybeEmitLeaderboard();
-    this.emitHud();
+    this.collide(interactive);
+    return throttle;
   }
 
   private maybeEmitLeaderboard(): void {
@@ -1691,7 +1866,11 @@ export class CityRideGame {
     return this.city.roadCenters.some((c) => Math.abs(x - c) < ROAD / 2 || Math.abs(y - c) < ROAD / 2);
   }
 
-  private collide(): void {
+  /**
+   * Упор в стены и щиты. `interactive` включает локальную выдачу щита: в онлайне
+   * это решает сервер (updateOnlineInteractions), а здесь остаётся только физика.
+   */
+  private collide(interactive = true): void {
     const c = this.car;
     let hit = false;
     let billboardContact: Billboard | null = null;
@@ -1704,13 +1883,13 @@ export class CityRideGame {
         billboardContact = b;
         // Повторное взаимодействие возможно, но только после того, как игрок
         // отъехал от щита и снова в него въехал.
-        if (this.billboardContact !== b && b.state === "ready") {
+        if (interactive && this.billboardContact !== b && b.state === "ready") {
           if (this.hasInactiveStations()) this.discover(b);
           else this.cb.onBillboardUnavailable();
         }
       }
     }
-    this.billboardContact = billboardContact;
+    if (interactive) this.billboardContact = billboardContact;
     // деревья (мягко, по «стволу»)
     for (const t of this.city.trees) {
       const dx = c.x - t.x;
