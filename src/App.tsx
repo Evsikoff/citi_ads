@@ -7,6 +7,7 @@ import type { HudData, LeaderboardEntry } from "./game/engine";
 import { sfx } from "./game/audio";
 import { CONFIG } from "./game/config";
 import { ClientModal } from "./components/ClientModal";
+import boostersIcon from "./images/boosters/boosters.png";
 
 const fmtMoney = (v: number) => Math.round(v).toLocaleString("ru-RU");
 const floorTenth = (v: number) => Math.floor(v * 10) / 10;
@@ -397,8 +398,19 @@ export default function App() {
       {/* ================= HUD ================= */}
       {phase === "play" && (
         <>
-          {/* левый верх: время и касса */}
+          {/* левый верх: прокачка, время и касса */}
           <div className="absolute top-4 left-4 z-10 pointer-events-none flex flex-col items-start gap-2">
+            <button
+              type="button"
+              className="pointer-events-auto group flex items-center gap-2.5 rounded-lg pr-3 text-left transition-transform hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-glow/80"
+            >
+              <span className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-night-600 bg-night-900/85 shadow-[0_8px_24px_rgba(0,0,0,0.4)] transition-colors group-hover:border-amber-glow/60">
+                <img src={boostersIcon} alt="" className="h-full w-full object-cover" />
+              </span>
+              <span className="font-display text-xs tracking-[0.12em] text-[#f2ecdf] transition-colors group-hover:text-amber-glow">
+                ПРОКАЧКА
+              </span>
+            </button>
             <div className="flex items-center gap-2 bg-night-900/85 border border-night-600 rounded-md px-3 py-1.5 text-xs text-slate-400">
               <svg viewBox="0 0 24 24" fill="none" className="w-3.5 h-3.5">
                 <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" />
