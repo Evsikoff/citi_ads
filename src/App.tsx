@@ -610,8 +610,13 @@ export default function App() {
                             className="h-12 w-12 shrink-0 rounded-lg border border-night-600 object-cover shadow-inner disabled:grayscale"
                           />
                           <span className="min-w-0 flex-1">
-                            <span className="block font-display text-sm leading-tight text-[#f2ecdf] group-enabled/item:group-hover/item:text-amber-glow">
-                              {formatBoosterName(booster.name, CONFIG.startMoney)}
+                            <span className="flex items-center gap-1.5 font-display text-sm leading-tight text-[#f2ecdf] group-enabled/item:group-hover/item:text-amber-glow">
+                              <span>{formatBoosterName(booster.name, CONFIG.startMoney)}</span>
+                              {booster.sales_method === "Video advertising" && (
+                                <span role="img" aria-label="Видео-реклама" title="Видео-реклама">
+                                  🎥
+                                </span>
+                              )}
                             </span>
                             <span className="mt-1 block text-[10px] leading-tight text-slate-500">
                               {status}
@@ -707,8 +712,13 @@ export default function App() {
                           className="h-12 w-12 shrink-0 rounded-lg border border-night-600 object-cover shadow-inner"
                         />
                         <span className="min-w-0 flex-1">
-                          <span className="block font-display text-sm leading-tight text-[#f2ecdf]">
-                            {formatBoosterName(booster.name, CONFIG.startMoney)}
+                          <span className="flex items-center gap-1.5 font-display text-sm leading-tight text-[#f2ecdf]">
+                            <span>{formatBoosterName(booster.name, CONFIG.startMoney)}</span>
+                            {booster.sales_method === "Video advertising" && (
+                              <span role="img" aria-label="Видео-реклама" title="Видео-реклама">
+                                🎥
+                              </span>
+                            )}
                           </span>
                           <span className="mt-1 block text-[10px] leading-tight text-slate-500">
                             {available ? "Просмотреть рекламу" : "Лимит исчерпан"}

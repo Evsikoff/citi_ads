@@ -1159,10 +1159,19 @@ export class CityRideGame {
       }
     } else {
       if (this.refueling && stop) this.cb.onRefuelStop(stop);
+      const completedStation = this.refuelStation;
       this.refueling = false;
       this.refuelStation = null;
-      // пока стоим на этой площадке, новую заправку не начинаем; съехали — забываем
-      this.usedStation = at;
+      // Помечаем площадку использованной только после реальной заправки либо
+      // если подъехали к активной колонке с уже полным баком. Простой заезд на
+      // закрытую АЗС не должен скрывать контекстный бустер.
+      if (completedStation) {
+        this.usedStation = completedStation;
+      } else if (this.usedStation) {
+        if (at !== this.usedStation) this.usedStation = null;
+      } else if (at?.state === "active") {
+        this.usedStation = at;
+      }
     }
     // предупреждение о низком баке
     if (!this.stalled && this.fuel < this.fuelMax * 0.22 && this.fuel > 0) {
