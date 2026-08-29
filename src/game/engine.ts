@@ -9,6 +9,7 @@ import { CONFIG } from "./config";
 
 export interface HudData {
   speed: number;
+  speedMax: number;
   found: number;
   total: number;
   time: number;
@@ -196,6 +197,8 @@ export class CityRideGame {
   private fuelMax = CONFIG.startTankVolume; // растёт с каждой подобранной канистрой
   private canisters = 0; // канистр у игрока
   private money = CONFIG.startMoney; // рублей на счету
+  private speedMultiplier = 1;
+  private fuelConsumptionMultiplier = 1;
   private sessionLiters = 0; // сколько литров налили на этой колонке
   private sessionSpent = 0; // и сколько рублей за них отдали
   private totalLitersFilled = 0; // рейтинг: все литры, залитые игроком за текущий заезд
@@ -311,6 +314,59 @@ export class CityRideGame {
     return true;
   }
 
+  /** Применяет игровой эффект уже полученного бустера. */
+  applyBooster(systemName: string): { applied: boolean; revived: boolean } {
+    const speed = /^speed(\d+(?:\.\d+)?)$/.exec(systemName);
+    if (speed) {
+      const percent = Number(speed[1]);
+      if (!Number.isFinite(percent) || percent < 0) return { applied: false, revived: false };
+      this.speedMultiplier = Math.max(this.speedMultiplier, 1 + percent / 100);
+      this.emitHud();
+      return { applied: true, revived: false };
+    }
+
+    const consumption = /^consumption(\d+(?:\.\d+)?)$/.exec(systemName);
+    if (consumption) {
+      const percent = Number(consumption[1]);
+      if (!Number.isFinite(percent) || percent < 0) return { applied: false, revived: false };
+      this.fuelConsumptionMultiplier = Math.min(
+        this.fuelConsumptionMultiplier,
+        Math.max(0, 1 - percent / 100)
+      );
+      this.emitHud();
+      return { applied: true, revived: false };
+    }
+
+    const fuel = /^fuel(\d+(?:\.\d+)?)l$/.exec(systemName);
+    if (fuel) {
+      const liters = Number(fuel[1]);
+      if (!Number.isFinite(liters) || liters <= 0) return { applied: false, revived: false };
+      this.fuel = Math.min(this.fuelMax, this.fuel + liters);
+      const revived = this.stalled && this.fuel > 0;
+      if (revived) {
+        this.stalled = false;
+        this.gameOverSent = false;
+        this.car.speed = 0;
+        sfx.engineStart();
+      }
+      this.emitHud();
+      return { applied: true, revived };
+    }
+
+    const money = /^money(\d+(?:\.\d+)?)$/.exec(systemName);
+    if (money) {
+      const coefficient = Number(money[1]);
+      if (!Number.isFinite(coefficient) || coefficient <= 0) {
+        return { applied: false, revived: false };
+      }
+      this.money += Math.floor(CONFIG.startMoney * coefficient);
+      this.emitHud();
+      return { applied: true, revived: false };
+    }
+
+    return { applied: false, revived: false };
+  }
+
   /** Активирует именно ту закрытую АЗС, рядом с которой сейчас находится игрок. */
   activateNearbyInactiveStation(): boolean {
     const station = this.nearbyInactiveStation;
@@ -357,6 +413,8 @@ export class CityRideGame {
     this.fuelMax = CONFIG.startTankVolume;
     this.fuel = Math.min(CONFIG.startFuel, this.fuelMax);
     this.money = CONFIG.startMoney;
+    this.speedMultiplier = 1;
+    this.fuelConsumptionMultiplier = 1;
     this.sessionLiters = 0;
     this.sessionSpent = 0;
     this.totalLitersFilled = 0;
@@ -389,6 +447,10 @@ export class CityRideGame {
     this.car.speed = 0;
     this.cam.x = this.car.x;
     this.cam.y = this.car.y;
+  }
+
+  private getPlayerMaxSpeed(): number {
+    return MAX_SPEED * this.speedMultiplier;
   }
 
   /**
@@ -505,6 +567,7 @@ export class CityRideGame {
     this.crashCd -= dt;
 
     const c = this.car;
+    const maxSpeed = this.getPlayerMaxSpeed();
 
     // на время заправки машина замирает и не слушается руля
     if (this.refueling) {
@@ -567,18 +630,18 @@ export class CityRideGame {
         this.spawn(c.x - Math.cos(c.angle) * 16, c.y - Math.sin(c.angle) * 16, "smoke", "rgba(128,138,116,0.4)", 1, 50);
       }
     }
-    c.speed = clamp(c.speed, -REV_MAX, MAX_SPEED);
+    c.speed = clamp(c.speed, -REV_MAX, maxSpeed);
 
     // руль
     const dir = (left ? -1 : 0) + (right ? 1 : 0);
     const sp = Math.abs(c.speed);
-    let grip = Math.min(sp / 150, 1) * (1 - 0.42 * (sp / MAX_SPEED));
+    let grip = Math.min(sp / 150, 1) * (1 - 0.42 * (sp / maxSpeed));
     if (hb) grip *= 1.75;
     c.angle += dir * 3.1 * grip * (c.speed < -1 ? -1 : 1) * dt;
     c.steer += (dir - c.steer) * Math.min(1, 10 * dt);
 
     // следы юза
-    const skidding = (hb && sp > 140) || (dir !== 0 && sp > MAX_SPEED * 0.68);
+    const skidding = (hb && sp > 140) || (dir !== 0 && sp > maxSpeed * 0.68);
     const hx = Math.cos(c.angle);
     const hy = Math.sin(c.angle);
     const px = -hy;
@@ -628,7 +691,7 @@ export class CityRideGame {
     this.displaySpeed += (sp - this.displaySpeed) * Math.min(1, 8 * dt);
 
     if (this.stalled) sfx.engineIdle();
-    else sfx.engine(sp / MAX_SPEED, throttle);
+    else sfx.engine(sp / maxSpeed, throttle);
     this.maybeEmitLeaderboard();
     this.emitHud();
   }
@@ -666,6 +729,7 @@ export class CityRideGame {
   private emitHud(): void {
     this.cb.onHud({
       speed: Math.round(this.displaySpeed * KMH),
+      speedMax: Math.round(this.getPlayerMaxSpeed() * KMH),
       found: this.found,
       total: this.total,
       time: this.time,
@@ -1047,11 +1111,12 @@ export class CityRideGame {
   private updateFuel(dt: number): void {
     const c = this.car;
     const sp = Math.abs(c.speed);
-    const speed01 = sp / MAX_SPEED;
+    const speed01 = sp / this.getPlayerMaxSpeed();
     const up = this.keys.has("up");
     // доли считаются от «расхода на полном газу»: холостой ход, газ и ручник
     const burn =
       CONFIG.fuelBurnPerSecond *
+      this.fuelConsumptionMultiplier *
       (0.09 +
         (up && !this.stalled ? 0.42 + speed01 * 0.49 : 0) +
         (this.keys.has("hb") && sp > 250 ? 0.39 : 0));
@@ -1462,7 +1527,7 @@ export class CityRideGame {
       const sp = Math.abs(this.car.speed);
       tx = this.car.x + Math.cos(this.car.angle) * sp * 0.33;
       ty = this.car.y + Math.sin(this.car.angle) * sp * 0.33;
-      tz = 1.04 - (sp / MAX_SPEED) * 0.22;
+      tz = 1.04 - (sp / this.getPlayerMaxSpeed()) * 0.22;
     }
     const kp = 1 - Math.exp(-6 * dt);
     const kz = 1 - Math.exp(-3 * dt);

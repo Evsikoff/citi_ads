@@ -175,7 +175,7 @@ export default function App() {
       onHud: (h: HudData) => {
         if (speedTextRef.current) speedTextRef.current.textContent = String(h.speed);
         if (timerRef.current) timerRef.current.textContent = fmt(h.time);
-        const pct = Math.min(h.speed / 180, 1);
+        const pct = Math.min(h.speed / Math.max(1, h.speedMax), 1);
         if (needleRef.current) needleRef.current.style.transform = `rotate(${pct * 270}deg)`;
         if (arcRef.current) arcRef.current.style.strokeDashoffset = String(100 - pct * 100);
         const f = h.fuel;
@@ -296,12 +296,14 @@ export default function App() {
   };
 
   const buyBooster = (booster: Booster) => {
-    const balance = gameRef.current?.getMoney() ?? boosterBalance;
+    const game = gameRef.current;
+    if (!game) return;
+    const balance = game.getMoney();
     if (!isBoosterAvailable(booster, boosterPurchases, balance, CONFIG.startMoney)) return;
 
     const completed =
       booster.sales_method === "In-game currency"
-        ? (gameRef.current?.trySpendMoney(calculateBoosterCost(booster, CONFIG.startMoney)) ?? false)
+        ? game.trySpendMoney(calculateBoosterCost(booster, CONFIG.startMoney))
         : executeExternalBoosterSale(booster);
 
     if (!completed) {
@@ -309,13 +311,24 @@ export default function App() {
       return;
     }
 
-    setBoosterBalance(gameRef.current?.getMoney() ?? balance);
+    const effect = game.applyBooster(booster.system_name);
+    if (!effect.applied) {
+      showToast("Для этого улучшения пока не настроен игровой эффект");
+      return;
+    }
+
+    if (effect.revived) setGameover(null);
+    setBoosterBalance(game.getMoney());
     setBoosterPurchases((current) => ({
       ...current,
       [booster.id]: (current[booster.id] ?? 0) + 1,
     }));
     sfx.tick();
-    showToast(`${formatBoosterName(booster.name, CONFIG.startMoney)} — получено`);
+    showToast(
+      effect.revived
+        ? `${formatBoosterName(booster.name, CONFIG.startMoney)} — можно ехать дальше`
+        : `${formatBoosterName(booster.name, CONFIG.startMoney)} — получено`
+    );
   };
 
   const activateInactiveStationBooster = (booster: Booster) => {
