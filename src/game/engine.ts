@@ -295,6 +295,19 @@ export class CityRideGame {
     else this.keys.delete(k);
   }
 
+  getMoney(): number {
+    return this.money;
+  }
+
+  /** Атомарно списывает игровую валюту, если на счету хватает денег. */
+  trySpendMoney(amount: number): boolean {
+    const cost = Math.max(0, Math.floor(amount));
+    if (!Number.isFinite(cost) || this.money < cost) return false;
+    this.money -= cost;
+    this.emitHud();
+    return true;
+  }
+
   reset(): void {
     for (const b of this.city.billboards) {
       b.discovered = false;

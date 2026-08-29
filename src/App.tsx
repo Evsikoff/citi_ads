@@ -6,12 +6,30 @@ import { CityRideGame } from "./game/engine";
 import type { HudData, LeaderboardEntry } from "./game/engine";
 import { sfx } from "./game/audio";
 import { CONFIG } from "./game/config";
+import {
+  BOOSTER_MENU_ITEMS,
+  calculateBoosterCost,
+  executeExternalBoosterSale,
+  formatBoosterName,
+  getMaximumPurchases,
+  isBoosterAvailable,
+} from "./game/boosters";
+import type { Booster } from "./game/boosters";
 import { ClientModal } from "./components/ClientModal";
 import boostersIcon from "./images/boosters/boosters.png";
 
 const fmtMoney = (v: number) => Math.round(v).toLocaleString("ru-RU");
 const floorTenth = (v: number) => Math.floor(v * 10) / 10;
 const SELL_PERCENTAGES = [12.5, 25, 37.5, 50] as const;
+const boosterIconModules = import.meta.glob("./images/boosters/*.png", {
+  eager: true,
+  import: "default",
+}) as Record<string, string>;
+
+const getBoosterIcon = (filename: string) => {
+  const path = `./${filename.replace(/\\/g, "/").replace(/^src\//, "")}`;
+  return boosterIconModules[path] ?? boostersIcon;
+};
 
 const fmt = (t: number) => {
   const m = Math.floor(t / 60);
@@ -117,6 +135,7 @@ export default function App() {
   const refuelPriceRef = useRef<HTMLSpanElement>(null);
   const refuelLimitRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
+  const boostersMenuRef = useRef<HTMLDivElement>(null);
 
   const [phase, setPhase] = useState<"menu" | "play">("menu");
   const [modal, setModal] = useState<{ client: Client; index: number } | null>(null);
@@ -128,6 +147,9 @@ export default function App() {
   const [sellLiters, setSellLiters] = useState(0);
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [mapOpen, setMapOpen] = useState(false);
+  const [boostersOpen, setBoostersOpen] = useState(false);
+  const [boosterBalance, setBoosterBalance] = useState(CONFIG.startMoney);
+  const [boosterPurchases, setBoosterPurchases] = useState<Record<string, number>>({});
   const [touch] = useState(
     () => typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches
   );
@@ -170,6 +192,9 @@ export default function App() {
           if (canisterCountRef.current) canisterCountRef.current.textContent = String(h.canisters);
         }
         if (moneyRef.current) moneyRef.current.textContent = fmtMoney(h.money);
+        setBoosterBalance((current) =>
+          Math.floor(current) === Math.floor(h.money) ? current : h.money
+        );
         if (h.refueling) {
           if (refuelPriceRef.current) refuelPriceRef.current.textContent = `${h.refuelPrice} ₽/л · отдано ${fmtMoney(h.refuelSpent)} ₽`;
           if (refuelLimitRef.current) {
@@ -229,11 +254,24 @@ export default function App() {
     gameRef.current?.setPaused(!!modal || !!sell);
   }, [modal, sell]);
 
+  useEffect(() => {
+    if (!boostersOpen) return;
+
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!boostersMenuRef.current?.contains(event.target as Node)) setBoostersOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+  }, [boostersOpen]);
+
   const start = () => {
     sfx.init();
     sfx.tick();
     gameRef.current?.begin();
     setMapOpen(false);
+    setBoostersOpen(false);
+    setBoosterBalance(CONFIG.startMoney);
+    setBoosterPurchases({});
     setPhase("play");
   };
 
@@ -244,7 +282,33 @@ export default function App() {
     setModal(null);
     setGameover(null);
     setMapOpen(false);
+    setBoostersOpen(false);
+    setBoosterBalance(CONFIG.startMoney);
+    setBoosterPurchases({});
     showToast("Новая охота: билборды снова доступны, бак полный");
+  };
+
+  const buyBooster = (booster: Booster) => {
+    const balance = gameRef.current?.getMoney() ?? boosterBalance;
+    if (!isBoosterAvailable(booster, boosterPurchases, balance, CONFIG.startMoney)) return;
+
+    const completed =
+      booster.sales_method === "In-game currency"
+        ? (gameRef.current?.trySpendMoney(calculateBoosterCost(booster, CONFIG.startMoney)) ?? false)
+        : executeExternalBoosterSale(booster);
+
+    if (!completed) {
+      showToast("Не удалось получить улучшение — попробуй ещё раз");
+      return;
+    }
+
+    setBoosterBalance(gameRef.current?.getMoney() ?? balance);
+    setBoosterPurchases((current) => ({
+      ...current,
+      [booster.id]: (current[booster.id] ?? 0) + 1,
+    }));
+    sfx.tick();
+    showToast(`${formatBoosterName(booster.name, CONFIG.startMoney)} — получено`);
   };
 
   const toggleMute = () => {
@@ -271,7 +335,8 @@ export default function App() {
       }
       if (e.code === "KeyV") toggleMute();
       if (e.code === "Escape") {
-        if (mapOpen) setMapOpen(false);
+        if (boostersOpen) setBoostersOpen(false);
+        else if (mapOpen) setMapOpen(false);
         else if (modal) setModal(null);
         else if (win) setWin(null);
       }
@@ -279,7 +344,7 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, modal, sell, win, gameover, mapOpen]);
+  }, [phase, modal, sell, win, gameover, mapOpen, boostersOpen]);
 
   const hold = (k: "up" | "down" | "left" | "right") => ({
     onPointerDown: (e: ReactPointerEvent) => {
@@ -400,17 +465,107 @@ export default function App() {
         <>
           {/* левый верх: прокачка, время и касса */}
           <div className="absolute top-4 left-4 z-10 pointer-events-none flex flex-col items-start gap-2">
-            <button
-              type="button"
-              className="pointer-events-auto group flex items-center gap-2.5 rounded-lg pr-3 text-left transition-transform hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-glow/80"
-            >
-              <span className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-night-600 bg-night-900/85 shadow-[0_8px_24px_rgba(0,0,0,0.4)] transition-colors group-hover:border-amber-glow/60">
-                <img src={boostersIcon} alt="" className="h-full w-full object-cover" />
-              </span>
-              <span className="font-display text-xs tracking-[0.12em] text-[#f2ecdf] transition-colors group-hover:text-amber-glow">
-                ПРОКАЧКА
-              </span>
-            </button>
+            <div ref={boostersMenuRef} className="pointer-events-auto relative">
+              <button
+                type="button"
+                onClick={() => setBoostersOpen((open) => !open)}
+                aria-expanded={boostersOpen}
+                aria-controls="boosters-menu"
+                className="group flex items-center gap-2.5 rounded-lg pr-2 text-left transition-transform hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-glow/80"
+              >
+                <span className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-night-600 bg-night-900/85 shadow-[0_8px_24px_rgba(0,0,0,0.4)] transition-colors group-hover:border-amber-glow/60">
+                  <img src={boostersIcon} alt="" className="h-full w-full object-cover" />
+                </span>
+                <span className="font-display text-xs tracking-[0.12em] text-[#f2ecdf] transition-colors group-hover:text-amber-glow">
+                  ПРОКАЧКА
+                </span>
+                <span
+                  aria-hidden="true"
+                  className={`text-xs text-slate-500 transition-transform ${boostersOpen ? "rotate-180" : ""}`}
+                >
+                  ▾
+                </span>
+              </button>
+
+              {boostersOpen && (
+                <div
+                  id="boosters-menu"
+                  className="anim-pop absolute left-0 top-[calc(100%+8px)] w-[min(360px,calc(100vw-2rem))] max-h-[min(70vh,580px)] overflow-y-auto rounded-xl border border-night-600 bg-night-900/95 p-2 shadow-[0_24px_70px_rgba(0,0,0,0.72)] backdrop-blur-md"
+                >
+                  <div className="px-2 pb-2 pt-1">
+                    <div className="font-display text-[11px] tracking-[0.14em] text-[#f2ecdf]">
+                      УЛУЧШЕНИЯ
+                    </div>
+                    <div className="mt-1 text-[10px] leading-snug text-slate-500">
+                      Покупки и зависимости действуют до конца текущего заезда.
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-2">
+                    {BOOSTER_MENU_ITEMS.map((booster) => {
+                      const purchased = boosterPurchases[booster.id] ?? 0;
+                      const maximum = getMaximumPurchases(booster);
+                      const cost = calculateBoosterCost(booster, CONFIG.startMoney);
+                      const available = isBoosterAvailable(
+                        booster,
+                        boosterPurchases,
+                        boosterBalance,
+                        CONFIG.startMoney
+                      );
+                      const parent = booster.parent_booster
+                        ? BOOSTER_MENU_ITEMS.find((item) => item.id === booster.parent_booster)
+                        : undefined;
+
+                      let status: string;
+                      if (purchased >= maximum) {
+                        status = "Лимит исчерпан";
+                      } else if (parent && (boosterPurchases[parent.id] ?? 0) < 1) {
+                        status = `Сначала: ${formatBoosterName(parent.name, CONFIG.startMoney)}`;
+                      } else if (booster.sales_method === "In-game currency") {
+                        status = !Number.isFinite(cost)
+                          ? "Цена не настроена"
+                          : boosterBalance >= cost
+                            ? `${fmtMoney(cost)} ₽`
+                            : `Не хватает ${fmtMoney(cost - boosterBalance)} ₽`;
+                      } else if (booster.sales_method === "In-app purchase") {
+                        status = "Покупка в приложении · заглушка";
+                      } else if (booster.sales_method === "Video advertising") {
+                        status = "Просмотр рекламы · заглушка";
+                      } else {
+                        status = `${booster.sales_method} · заглушка`;
+                      }
+
+                      return (
+                        <button
+                          key={booster.id}
+                          type="button"
+                          disabled={!available}
+                          onClick={() => buyBooster(booster)}
+                          className="group/item flex min-h-[66px] w-full items-center gap-3 rounded-lg border border-night-600 bg-night-800/95 p-2 text-left shadow-[0_7px_18px_rgba(0,0,0,0.28)] transition-all enabled:hover:-translate-y-0.5 enabled:hover:border-amber-glow/60 enabled:hover:bg-[#182238] enabled:active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-45"
+                        >
+                          <img
+                            src={getBoosterIcon(booster.icon_filename)}
+                            alt=""
+                            className="h-12 w-12 shrink-0 rounded-lg border border-night-600 object-cover shadow-inner disabled:grayscale"
+                          />
+                          <span className="min-w-0 flex-1">
+                            <span className="block font-display text-sm leading-tight text-[#f2ecdf] group-enabled/item:group-hover/item:text-amber-glow">
+                              {formatBoosterName(booster.name, CONFIG.startMoney)}
+                            </span>
+                            <span className="mt-1 block text-[10px] leading-tight text-slate-500">
+                              {status}
+                            </span>
+                          </span>
+                          <span className="shrink-0 self-start rounded bg-night-950/70 px-1.5 py-1 text-[9px] tabular-nums text-slate-500">
+                            {purchased}/{maximum}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
             <div className="flex items-center gap-2 bg-night-900/85 border border-night-600 rounded-md px-3 py-1.5 text-xs text-slate-400">
               <svg viewBox="0 0 24 24" fill="none" className="w-3.5 h-3.5">
                 <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" />
