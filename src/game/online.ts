@@ -90,6 +90,9 @@ export interface RemoteEntityState {
   color: string;
   filledLiters: number;
   status?: string;
+  fuel?: number;
+  tankVolume?: number;
+  money?: number;
   canisters?: number;
   taken?: number;
   wait?: number;
@@ -97,6 +100,10 @@ export interface RemoteEntityState {
   refuelStationId?: string | null;
   refuelDuration?: number;
   refuelRemaining?: number;
+  refuelTargetLiters?: number;
+  refuelLiters?: number;
+  refuelSpent?: number;
+  respawnRemaining?: number;
   style?: number;
   lane?: number;
   wobble?: number;

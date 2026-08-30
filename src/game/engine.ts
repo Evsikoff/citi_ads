@@ -2,7 +2,7 @@ import { buildCity, WORLD, ROAD, SIDEWALK, BLOCK, GRID, CANISTER_R } from "./wor
 import type { City, Rect, Billboard, Tree, Lamp, Station, Canister } from "./world";
 import type { Client } from "./clients";
 import { sfx } from "./audio";
-import { createBots, stepBot } from "./bots";
+import { createBot, createBots, stepBot } from "./bots";
 import type { Bot } from "./bots";
 import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
 import { CONFIG } from "./config";
@@ -114,7 +114,7 @@ const REMOTE_SNAP = 260; // расхождение больше — телепо
 const REMOTE_EXTRAPOLATE_S = 0.35; // сколько продлеваем чужое движение без новых данных
 const PLAYERS = 1 + CONFIG.botCount; // участников заезда: игрок и боты
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
-const CANISTER_L = 10; // на столько литров канистра увеличивает бак
+const CANISTER_L = CONFIG.canisterTankBonus;
 const INACTIVE_STATION_PROXIMITY = 120; // расстояние от края площадки для показа контекстного бустера
 // T = базовый таймаут + надбавка за каждую канистру, оба значения из config.ts
 const refuelDuration = (canisters: number): number =>
@@ -414,7 +414,7 @@ export class CityRideGame {
     if (me) this.applyServerPlayer(me);
 
     const others: RemoteEntityState[] = [
-      ...snapshot.bots,
+      ...snapshot.bots.filter((bot) => bot.status !== "lost"),
       ...snapshot.players.filter(
         (player) => player.id !== this.onlinePlayerId && player.status === "active"
       ),
@@ -900,6 +900,10 @@ export class CityRideGame {
       speed: entity.speed,
       color: entity.color,
       name: entity.name,
+      fuel: entity.fuel ?? CONFIG.startFuel,
+      tankVolume: entity.tankVolume ?? CONFIG.startTankVolume,
+      money: entity.money ?? CONFIG.startMoney,
+      status: entity.status === "lost" ? "lost" : "active",
       filledLiters: entity.filledLiters,
       plan: "station",
       goal: null,
@@ -907,10 +911,14 @@ export class CityRideGame {
       refuelled: false,
       wait: entity.refuelRemaining ?? entity.wait ?? 0,
       refuelTotal: entity.refuelDuration ?? entity.wait ?? 0,
+      refuelTargetLiters: entity.refuelTargetLiters ?? 0,
+      refuelLiters: entity.refuelLiters ?? 0,
+      refuelSpent: entity.refuelSpent ?? 0,
       at:
-        entity.refueling && entity.refuelStationId
+        entity.refuelStationId
           ? this.city.stations.find((station) => station.id === entity.refuelStationId) ?? null
           : null,
+      respawnRemaining: entity.respawnRemaining ?? 0,
       think: 0,
       taken: entity.taken ?? entity.canisters ?? 0,
       kx: entity.kx ?? 0,
@@ -1537,6 +1545,7 @@ export class CityRideGame {
       },
     ];
     for (const b of this.bots) {
+      if (b.status !== "active") continue;
       cars.push({
         x: b.x,
         y: b.y,
@@ -1688,6 +1697,11 @@ export class CityRideGame {
     }
     if (victim.bot) {
       victim.bot.taken -= drop;
+      victim.bot.tankVolume = Math.max(
+        CONFIG.startTankVolume,
+        victim.bot.tankVolume - drop * CONFIG.canisterTankBonus
+      );
+      victim.bot.fuel = Math.min(victim.bot.fuel, victim.bot.tankVolume);
       victim.bot.gotCanister = victim.bot.taken > 0;
       victim.bot.think = 0;
     } else {
@@ -1717,8 +1731,20 @@ export class CityRideGame {
   /* -------- боты-конкуренты -------- */
 
   private updateBots(dt: number): void {
-    for (const b of this.bots) {
+    for (let index = 0; index < this.bots.length; index++) {
+      let b = this.bots[index];
       const step = stepBot(b, this.city, dt, this.car, refuelDuration(b.taken));
+      if (step.respawn) {
+        const occupied = this.bots.filter((other, otherIndex) => otherIndex !== index && other.status === "active");
+        b = createBot(this.city, index, START, occupied);
+        this.bots[index] = b;
+        this.leaderboardDirty = true;
+        continue;
+      }
+      if (step.lost) {
+        this.leaderboardDirty = true;
+        continue;
+      }
       this.keepBotOutOfWalls(b);
       if (step.took) {
         for (let i = 0; i < 12; i++) {
@@ -1735,13 +1761,9 @@ export class CityRideGame {
         }
       }
       if (step.refuelAt) {
-        // Боты не ведут полноценную модель бака, поэтому фактический объём их
-        // заправки считаем по вместимости и реальному лимиту выбранной колонки.
-        const requested = 18 + b.taken * CANISTER_L;
-        b.filledLiters += Math.min(requested, step.refuelAt.limit ?? requested);
-        this.leaderboardDirty = true;
         this.takeStation(step.refuelAt, b.taken, false);
       }
+      if (step.filledLiters > 0) this.leaderboardDirty = true;
     }
   }
 
@@ -2977,6 +2999,7 @@ export class CityRideGame {
   private drawBots(vis: Rect): void {
     const { ctx } = this;
     for (const b of this.bots) {
+      if (b.status !== "active") continue;
       if (!inView({ x: b.x - 26, y: b.y - 26, w: 52, h: 52 }, vis)) continue;
       ctx.save();
       ctx.translate(b.x, b.y);
@@ -3046,6 +3069,7 @@ export class CityRideGame {
       );
     }
     for (const b of this.bots) {
+      if (b.status !== "active") continue;
       if (b.wait <= 0 || !b.at) continue;
       if (!inView({ x: b.x - 80, y: b.y - 80, w: 160, h: 160 }, vis)) continue;
       this.drawInfoPlate(
@@ -3212,6 +3236,7 @@ export class CityRideGame {
     const c = this.car;
     this.paintHeadlights(c.x, c.y, c.angle, 235, 0.3);
     for (const b of this.bots) {
+      if (b.status !== "active") continue;
       if (!inView({ x: b.x - 160, y: b.y - 160, w: 320, h: 320 }, vis)) continue;
       // фары ботов короче и тусклее — множество машин иначе засветит весь квартал
       this.paintHeadlights(b.x, b.y, b.angle, 150, 0.16);
@@ -3513,6 +3538,7 @@ export class CityRideGame {
 
     // Конкуренты — маленькие точки их фирменных цветов.
     for (const bot of this.bots) {
+      if (bot.status !== "active") continue;
       m.fillStyle = bot.color;
       m.beginPath();
       m.arc(bot.x * s, bot.y * s, 1.7 * u, 0, Math.PI * 2);
