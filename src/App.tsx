@@ -20,6 +20,11 @@ import {
 import type { Booster } from "./game/boosters";
 import { ClientModal } from "./components/ClientModal";
 import boostersIcon from "./images/boosters/boosters.png";
+import {
+  GAME_SERVER_URL,
+  MultiplayerClient,
+} from "./game/online";
+import type { ConnectionStatus } from "./game/online";
 
 const fmtMoney = (v: number) => Math.round(v).toLocaleString("ru-RU");
 const floorTenth = (v: number) => Math.floor(v * 10) / 10;
@@ -120,6 +125,8 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const minimapRef = useRef<HTMLCanvasElement>(null);
   const gameRef = useRef<CityRideGame | null>(null);
+  const networkRef = useRef<MultiplayerClient | null>(null);
+  const networkStatusRef = useRef<ConnectionStatus>("connecting");
   const speedTextRef = useRef<HTMLSpanElement>(null);
   const needleRef = useRef<SVGGElement>(null);
   const arcRef = useRef<SVGPathElement>(null);
@@ -140,7 +147,8 @@ export default function App() {
   const toastTimer = useRef<number>(0);
   const boostersMenuRef = useRef<HTMLDivElement>(null);
 
-  const [phase, setPhase] = useState<"menu" | "play">("menu");
+  const [phase, setPhase] = useState<"loading" | "menu" | "play">("loading");
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [modal, setModal] = useState<{ client: Client; index: number } | null>(null);
   const [muted, setMuted] = useState(false);
   const [win, setWin] = useState<{ time: number; top: number } | null>(null);
@@ -256,6 +264,78 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    const network = new MultiplayerClient(GAME_SERVER_URL, {
+      onStatus: (status) => {
+        const wasOnline = networkStatusRef.current === "online";
+        networkStatusRef.current = status;
+        if (active) setConnectionStatus(status);
+        if (wasOnline && status === "offline") {
+          gameRef.current?.setOnlineTransport(null);
+          showToast("Связь с сервером потеряна — продолжаем локально");
+        }
+      },
+      onWelcome: (playerId, player) => {
+        gameRef.current?.setOnlinePlayer(playerId, player);
+      },
+      onSnapshot: (map, entities, rows) => {
+        gameRef.current?.applyWorldSnapshot(map, entities, rows);
+      },
+      onEntities: (entities) => {
+        gameRef.current?.applyEntities(entities);
+      },
+      onObjects: (objects) => {
+        gameRef.current?.applyWorldObjects(objects);
+      },
+      onMapUpdate: (map, reason, fuelBonus) => {
+        gameRef.current?.applyMapUpdate(map);
+        if (reason === "player-count") {
+          showToast(
+            fuelBonus > 0
+              ? `Город перестроен под новый онлайн. Бонус топлива: ${fuelBonus} л`
+              : "Город перестроен под число игроков"
+          );
+        }
+      },
+      onLeaderboard: (rows) => {
+        gameRef.current?.applyServerLeaderboard(rows);
+      },
+      onInteractionResult: (result) => {
+        gameRef.current?.applyInteractionResult(result);
+        if (!result.ok) showToast(`Действие отклонено сервером: ${result.code}`);
+      },
+      onGameEventResult: (result) => {
+        gameRef.current?.applyInteractionResult(result);
+        if (!result.ok) showToast(`Событие отклонено сервером: ${result.code}`);
+      },
+      onPlayerRespawned: (player) => {
+        gameRef.current?.applyRespawn(player);
+      },
+      onPlayerJoined: (player) => showToast(`${player.name} подключился к заезду`),
+      onPlayerLeft: () => showToast("Игрок покинул заезд"),
+      onError: (error) => {
+        if (networkStatusRef.current === "online") showToast(`Сервер: ${error.message}`);
+      },
+    });
+    networkRef.current = network;
+
+    const minimumLoaderTime = new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 1450);
+    });
+    Promise.all([network.connect(5000), minimumLoaderTime]).then(() => {
+      if (active) setPhase("menu");
+    });
+
+    return () => {
+      active = false;
+      network.destroy();
+      if (networkRef.current === network) networkRef.current = null;
+    };
+    // Подключаемся только один раз при загрузке приложения.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     gameRef.current?.setPaused(!!modal || !!sell);
   }, [modal, sell]);
 
@@ -272,7 +352,12 @@ export default function App() {
   const start = () => {
     sfx.init();
     sfx.tick();
-    gameRef.current?.begin();
+    const game = gameRef.current;
+    const network = networkRef.current;
+    const online = connectionStatus === "online" && !!network?.connected;
+    game?.setOnlineTransport(online && network ? network : null);
+    game?.begin();
+    if (online && network && game) network.join(game.getPlayerName());
     setMapOpen(false);
     setBoostersOpen(false);
     setBoosterBalance(CONFIG.startMoney);
@@ -283,7 +368,8 @@ export default function App() {
 
   const restart = () => {
     sfx.tick();
-    gameRef.current?.reset();
+    const game = gameRef.current;
+    if (!game?.requestOnlineRespawn()) game?.reset();
     setWin(null);
     setModal(null);
     setGameover(null);
@@ -439,6 +525,65 @@ export default function App() {
   return (
     <div className="fixed inset-0 overflow-hidden bg-night-900 no-select text-slate-200">
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
+
+      {/* ================= загрузка и проверка сервера ================= */}
+      {phase === "loading" && (
+        <div className="absolute inset-0 z-[100] overflow-hidden bg-[radial-gradient(circle_at_50%_45%,rgba(255,180,84,0.08),transparent_34%),linear-gradient(135deg,rgba(5,8,16,0.92),rgba(7,11,20,0.78))] backdrop-blur-[5px]">
+          <div className="loader-grid absolute inset-0 opacity-35" />
+          <div className="absolute left-5 top-5 flex items-center gap-2.5 text-amber-glow md:left-8 md:top-8">
+            <BillBoardIcon />
+            <span className="font-display text-sm tracking-[0.16em] text-[#f2ecdf]">
+              ГДЕ <span className="text-amber-glow">БЕНЗ?</span>
+            </span>
+          </div>
+
+          <div className="relative flex h-full items-center justify-center p-5">
+            <div className="w-full max-w-lg text-center">
+              <div className="loader-radar relative mx-auto h-28 w-28 rounded-full border border-night-600 bg-night-950/80 shadow-[0_0_80px_rgba(255,180,84,0.12)]">
+                <div className="loader-radar-sweep absolute inset-2 rounded-full" />
+                <div className="absolute inset-[29px] flex items-center justify-center rounded-full border border-amber-glow/45 bg-night-900 text-amber-glow shadow-[0_0_24px_rgba(255,180,84,0.24)]">
+                  <FuelIcon className="h-7 w-7" />
+                </div>
+                <span className="absolute left-[21px] top-[30px] h-1.5 w-1.5 rounded-full bg-aqua-glow shadow-[0_0_10px_#59d8c9]" />
+                <span className="absolute bottom-[22px] right-[27px] h-1.5 w-1.5 rounded-full bg-amber-glow shadow-[0_0_10px_#ffb454]" />
+              </div>
+
+              <div className="mt-7 text-[10px] font-bold uppercase tracking-[0.34em] text-slate-500">
+                подготовка ночного заезда
+              </div>
+              <h1 className="mt-3 font-display text-4xl leading-none text-[#f2ecdf] md:text-5xl">
+                ИЩЕМ <span className="text-amber-glow">СВЯЗЬ</span>
+              </h1>
+              <div className="mx-auto mt-7 h-1.5 max-w-sm overflow-hidden rounded-full bg-night-700 shadow-inner">
+                <div className="loader-progress h-full rounded-full bg-[linear-gradient(90deg,#ff8f4e,#ffcc72,#59d8c9)] shadow-[0_0_14px_rgba(255,180,84,0.65)]" />
+              </div>
+              <div className="mt-4 flex items-center justify-center gap-2 text-sm text-slate-400" role="status" aria-live="polite">
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    connectionStatus === "online"
+                      ? "bg-[#45e68a] shadow-[0_0_12px_#45e68a]"
+                      : connectionStatus === "offline"
+                        ? "bg-slate-500"
+                        : "bg-amber-glow anim-pulse-soft"
+                  }`}
+                />
+                {connectionStatus === "online"
+                  ? "Канал открыт — включаем онлайн-режим"
+                  : connectionStatus === "offline"
+                    ? "Сервер недоступен — готовим локальный заезд"
+                    : "Связываемся с городским сервером…"}
+              </div>
+              <div className="mt-3 font-mono text-[10px] tracking-wide text-slate-600">
+                WSS · PROTOCOL 01 · SECURE CHANNEL
+              </div>
+            </div>
+          </div>
+
+          <div className="absolute inset-x-5 bottom-5 md:inset-x-8 md:bottom-8">
+            <div className="stripes-amber h-2 rounded-sm opacity-60" />
+          </div>
+        </div>
+      )}
 
       {/* canvas карты всегда смонтирован, чтобы игровой движок мог обновлять его */}
       <div
@@ -997,6 +1142,15 @@ export default function App() {
                 </span>
               </div>
               <div className="flex items-center gap-2">
+                {connectionStatus === "online" && (
+                  <span
+                    className="inline-flex items-center gap-2 rounded-full border border-[#45e68a]/35 bg-[#45e68a]/10 px-2.5 py-1.5 text-[9px] font-bold uppercase tracking-[0.18em] text-[#8ff0b8] sm:px-3"
+                    title="Подключено к игровому серверу"
+                  >
+                    <span className="h-2 w-2 rounded-full bg-[#45e68a] shadow-[0_0_12px_#45e68a]" />
+                    <span className="hidden sm:inline">онлайн</span>
+                  </span>
+                )}
                 <span className="hidden sm:inline text-[10px] uppercase tracking-[0.2em] text-slate-500 border border-night-600 rounded-full px-3 py-1.5">
                   медиа-агентство «Щит и Пика»
                 </span>

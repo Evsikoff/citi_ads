@@ -6,6 +6,16 @@ import { createBots, stepBot } from "./bots";
 import type { Bot } from "./bots";
 import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
 import { CONFIG } from "./config";
+import type {
+  EntitySnapshot,
+  InteractionResult,
+  OnlineGameTransport,
+  PublicPlayerState,
+  RemoteEntityState,
+  ServerCity,
+  ServerLeaderboardEntry,
+  WorldObjects,
+} from "./online";
 
 export interface HudData {
   speed: number;
@@ -78,8 +88,28 @@ interface Skid {
   a: number;
 }
 
+/**
+ * Чужая машина в онлайне: `bot` — то, что реально рисуется и едет плавно,
+ * остальные поля — последняя серверная цель, к которой его подтягиваем.
+ */
+interface RemoteEntity {
+  bot: Bot;
+  x: number;
+  y: number;
+  angle: number;
+  speed: number;
+  age: number; // сколько секунд прошло с последнего снапшота
+}
+
 const REV_MAX = 215;
 const MM = 640;
+// Онлайн: движение машины считается локально каждый кадр, а серверные снапшоты
+// вливаются в картинку плавно — иначе машина дёргается на каждом пакете.
+const RECONCILE_RATE = 7; // насколько быстро гасим расхождение с сервером, 1/с
+const RECONCILE_SNAP = 220; // расхождение больше — сразу ставим машину на место сервера
+const REMOTE_SMOOTH_RATE = 12; // с какой скоростью чужие машины подтягиваются к цели
+const REMOTE_SNAP = 260; // расхождение больше — телепорт вместо догонялок
+const REMOTE_EXTRAPOLATE_S = 0.35; // сколько продлеваем чужое движение без новых данных
 const PLAYERS = 1 + CONFIG.botCount; // участников заезда: игрок и боты
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
 const CANISTER_L = 10; // на столько литров канистра увеличивает бак
@@ -89,6 +119,14 @@ const INACTIVE_STATION_PROXIMITY = 120; // расстояние от края п
 const M_PER_PX = 0.35; // метров в мировом пикселе — для подписей с дистанцией
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+
+/** кратчайший поворот от одного угла к другому, в диапазоне (-π, π] */
+function angleDelta(to: number, from: number): number {
+  let d = (to - from) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
 
 const PLAYER_COLOR = "#e5472f"; // машина игрока — единственная красная
 
@@ -232,6 +270,17 @@ export class CityRideGame {
   private billboardContact: Billboard | null = null;
   private leafCd = 0;
 
+  private online: OnlineGameTransport | null = null;
+  private onlinePlayerId: string | null = null;
+  private onlineInputCd = 0;
+  private onlineContacts = new Set<string>();
+  private onlinePlayerStatus = "active";
+  // Расхождение предсказанной машины с последним состоянием сервера. Не
+  // применяется рывком: reconcilePrediction() размазывает его по кадрам.
+  private serverError = { x: 0, y: 0, angle: 0, speed: 0 };
+  // Чужие машины и боты: отрисовка отдельно от того, что прислал сервер.
+  private remoteEntities = new Map<string, RemoteEntity>();
+
   private onKeyDown: (e: KeyboardEvent) => void;
   private onKeyUp: (e: KeyboardEvent) => void;
   private onBlur: () => void;
@@ -293,12 +342,159 @@ export class CityRideGame {
 
   setPaused(p: boolean): void {
     this.paused = p;
-    if (p) sfx.engineIdle();
+    if (p) {
+      sfx.engineIdle();
+      this.online?.sendInput({
+        up: false,
+        down: false,
+        left: false,
+        right: false,
+        handbrake: true,
+      });
+    }
   }
 
   setKey(k: "up" | "down" | "left" | "right" | "hb", v: boolean): void {
     if (v) this.keys.add(k);
     else this.keys.delete(k);
+  }
+
+  getPlayerName(): string {
+    return this.playerName;
+  }
+
+  isOnline(): boolean {
+    return this.online !== null && this.online.connected;
+  }
+
+  setOnlineTransport(transport: OnlineGameTransport | null): void {
+    this.online = transport;
+    this.onlineInputCd = 0;
+    this.onlineContacts.clear();
+    this.remoteEntities.clear();
+    this.resetServerError();
+    if (!transport) {
+      this.onlinePlayerId = null;
+      this.onlinePlayerStatus = "active";
+    }
+  }
+
+  setOnlinePlayer(playerId: string, player: PublicPlayerState): void {
+    this.onlinePlayerId = playerId;
+    this.applyServerPlayer(player, "snap");
+  }
+
+  applyWorldSnapshot(
+    map: ServerCity,
+    entities: EntitySnapshot,
+    leaderboard: ServerLeaderboardEntry[]
+  ): void {
+    this.replaceCity(map);
+    this.applyEntities(entities);
+    this.applyServerLeaderboard(leaderboard);
+  }
+
+  applyEntities(snapshot: EntitySnapshot): void {
+    const me = this.onlinePlayerId
+      ? snapshot.players.find((player) => player.id === this.onlinePlayerId)
+      : undefined;
+    if (me) this.applyServerPlayer(me);
+
+    const others: RemoteEntityState[] = [
+      ...snapshot.bots,
+      ...snapshot.players.filter(
+        (player) => player.id !== this.onlinePlayerId && player.status === "active"
+      ),
+    ];
+    this.syncRemoteEntities(others);
+  }
+
+  /**
+   * Серверные координаты чужих машин кладём в цель, а нарисованное положение
+   * оставляем прежним: до неё машина доедет за несколько кадров в
+   * updateRemoteEntities(). Иначе каждый снапшот выглядит как телепорт.
+   */
+  private syncRemoteEntities(entities: RemoteEntityState[]): void {
+    const next = new Map<string, RemoteEntity>();
+    for (const entity of entities) {
+      const bot = this.toRenderBot(entity);
+      const known = this.remoteEntities.get(entity.id);
+      if (known && Math.hypot(entity.x - known.bot.x, entity.y - known.bot.y) <= REMOTE_SNAP) {
+        bot.x = known.bot.x;
+        bot.y = known.bot.y;
+        bot.angle = known.bot.angle;
+        bot.speed = known.bot.speed;
+      }
+      next.set(entity.id, {
+        bot,
+        x: entity.x,
+        y: entity.y,
+        angle: entity.angle,
+        speed: entity.speed,
+        age: 0,
+      });
+    }
+    this.remoteEntities = next;
+    this.bots = [...next.values()].map((entity) => entity.bot);
+  }
+
+  /**
+   * Между снапшотами чужие машины продолжают ехать сами по последней скорости,
+   * а отрисовка плавно догоняет цель.
+   */
+  private updateRemoteEntities(dt: number): void {
+    const k = 1 - Math.exp(-REMOTE_SMOOTH_RATE * dt);
+    for (const entity of this.remoteEntities.values()) {
+      entity.age += dt;
+      if (entity.age < REMOTE_EXTRAPOLATE_S) {
+        entity.x += Math.cos(entity.angle) * entity.speed * dt;
+        entity.y += Math.sin(entity.angle) * entity.speed * dt;
+      }
+      const bot = entity.bot;
+      bot.x += (entity.x - bot.x) * k;
+      bot.y += (entity.y - bot.y) * k;
+      bot.angle += angleDelta(entity.angle, bot.angle) * k;
+      bot.speed += (entity.speed - bot.speed) * k;
+    }
+  }
+
+  applyWorldObjects(objects: WorldObjects): void {
+    this.city.stations = objects.stations;
+    this.city.billboards = objects.billboards;
+    this.city.canisters = objects.canisters;
+    this.afterObjectsChanged();
+  }
+
+  applyMapUpdate(map: ServerCity): void {
+    this.replaceCity(map);
+  }
+
+  applyServerLeaderboard(rows: ServerLeaderboardEntry[]): void {
+    this.cb.onLeaderboard(
+      rows.map(({ entityId, position, name, liters, color }) => ({
+        position,
+        name,
+        liters,
+        isPlayer: entityId === this.onlinePlayerId,
+        color,
+      }))
+    );
+  }
+
+  applyInteractionResult(result: InteractionResult): void {
+    if (result.player) this.applyServerPlayer(result.player);
+  }
+
+  applyRespawn(player: PublicPlayerState): void {
+    this.gameOverSent = false;
+    this.stalled = false;
+    this.onlinePlayerStatus = "active";
+    this.applyServerPlayer(player, "snap");
+  }
+
+  requestOnlineRespawn(): boolean {
+    if (!this.online?.connected) return false;
+    return this.online.respawn() !== null;
   }
 
   getMoney(): number {
@@ -374,6 +570,9 @@ export class CityRideGame {
       this.updateNearbyInactiveStation();
       return false;
     }
+    if (this.online?.connected) {
+      return !!station.id && this.online.interact("station", station.id) !== null;
+    }
     const activated = this.activateStation(station, "ad", true);
     if (activated) this.setNearbyInactiveStation(null);
     return activated;
@@ -406,6 +605,179 @@ export class CityRideGame {
     window.removeEventListener("blur", this.onBlur);
     window.removeEventListener("resize", this.onResize);
     sfx.engineIdle();
+  }
+
+  private replaceCity(map: ServerCity): void {
+    this.city = map;
+    this.total = new Set(map.billboards.map((billboard) => billboard.client.id)).size;
+    this.refuelStation = null;
+    this.usedStation = null;
+    this.billboardContact = null;
+    this.onlineContacts.clear();
+    this.afterObjectsChanged();
+    this.paintMinimapBase();
+  }
+
+  private afterObjectsChanged(): void {
+    this.stationsActive = this.city.stations.filter((station) => station.state === "active").length;
+    this.found = new Set(
+      this.city.billboards
+        .filter((billboard) =>
+          this.onlinePlayerId && billboard.discoveredBy
+            ? billboard.discoveredBy.includes(this.onlinePlayerId)
+            : billboard.discovered
+        )
+        .map((billboard) => billboard.client.id)
+    ).size;
+    this.updateNearbyInactiveStation();
+  }
+
+  private applyServerPlayer(
+    player: PublicPlayerState,
+    mode: "reconcile" | "snap" = "reconcile"
+  ): void {
+    if (this.onlinePlayerId && player.id !== this.onlinePlayerId) return;
+
+    const oldFuel = this.fuel;
+    const oldCanisters = this.canisters;
+    const fuelAdded = Math.max(0, player.fuel - oldFuel);
+
+    this.playerName = player.name;
+    this.applyServerPosition(player, mode);
+    this.fuel = player.fuel;
+    this.fuelMax = player.tankVolume;
+    this.money = player.money;
+    this.canisters = player.canisters;
+    this.totalLitersFilled = player.filledLiters;
+    this.onlinePlayerStatus = player.status;
+    this.stalled = player.status !== "active" || player.fuel <= 0;
+
+    if (fuelAdded > 0.001) {
+      this.sessionLiters += fuelAdded;
+      this.refuelStation = this.city.stations.find((station) =>
+        this.insideRect(this.car.x, this.car.y, station, 8)
+      ) ?? null;
+      this.sessionSpent += fuelAdded * (this.refuelStation?.price ?? 0);
+      this.refueling = this.refuelStation !== null;
+    } else {
+      this.refueling = false;
+      this.refuelStation = null;
+      this.sessionLiters = 0;
+      this.sessionSpent = 0;
+    }
+
+    if (player.canisters > oldCanisters) {
+      this.cb.onCanister(player.canisters, CANISTER_L);
+      sfx.chime();
+    }
+
+    const speed = Math.abs(player.speed);
+    this.topSpeed = Math.max(this.topSpeed, speed);
+    if (player.status !== "active" && !this.gameOverSent) {
+      this.gameOverSent = true;
+      this.cb.onGameOver({ time: this.time, found: this.found });
+    } else if (player.status === "active") {
+      this.gameOverSent = false;
+    }
+    this.emitHud();
+  }
+
+  /**
+   * Кладёт серверное положение на машину игрока. Пока работает локальное
+   * предсказание, разницу не применяем сразу, а копим в serverError: её
+   * равномерно размажет по кадрам reconcilePrediction(), поэтому коррекция не
+   * видна как рывок. Мгновенно двигаем машину только там, где предсказывать
+   * нечего: вход в игру, респавн, гибель и совсем уж большое расхождение.
+   */
+  private applyServerPosition(player: PublicPlayerState, mode: "reconcile" | "snap"): void {
+    const c = this.car;
+    const predicting =
+      mode === "reconcile" &&
+      this.phase === "play" &&
+      player.status === "active" &&
+      !!this.online?.connected;
+    const drift = Math.hypot(player.x - c.x, player.y - c.y);
+
+    if (!predicting || drift > RECONCILE_SNAP) {
+      c.x = player.x;
+      c.y = player.y;
+      c.angle = player.angle;
+      c.speed = player.speed;
+      this.resetServerError();
+      return;
+    }
+
+    this.serverError.x = player.x - c.x;
+    this.serverError.y = player.y - c.y;
+    this.serverError.angle = angleDelta(player.angle, c.angle);
+    this.serverError.speed = player.speed - c.speed;
+  }
+
+  /** гасит накопленное расхождение с сервером понемногу каждый кадр */
+  private reconcilePrediction(dt: number): void {
+    const e = this.serverError;
+    if (!e.x && !e.y && !e.angle && !e.speed) return;
+
+    const k = 1 - Math.exp(-RECONCILE_RATE * dt);
+    this.car.x += e.x * k;
+    this.car.y += e.y * k;
+    this.car.angle += e.angle * k;
+    this.car.speed += e.speed * k;
+    e.x -= e.x * k;
+    e.y -= e.y * k;
+    e.angle -= e.angle * k;
+    e.speed -= e.speed * k;
+
+    if (Math.abs(e.x) < 0.05) e.x = 0;
+    if (Math.abs(e.y) < 0.05) e.y = 0;
+    if (Math.abs(e.angle) < 0.0005) e.angle = 0;
+    if (Math.abs(e.speed) < 0.5) e.speed = 0;
+  }
+
+  private resetServerError(): void {
+    this.serverError.x = 0;
+    this.serverError.y = 0;
+    this.serverError.angle = 0;
+    this.serverError.speed = 0;
+  }
+
+  private toRenderBot(entity: RemoteEntityState): Bot {
+    return {
+      x: entity.x,
+      y: entity.y,
+      angle: entity.angle,
+      speed: entity.speed,
+      color: entity.color,
+      name: entity.name,
+      filledLiters: entity.filledLiters,
+      plan: "station",
+      goal: null,
+      gotCanister: false,
+      refuelled: false,
+      wait: entity.wait ?? 0,
+      at: null,
+      think: 0,
+      taken: entity.taken ?? entity.canisters ?? 0,
+      kx: 0,
+      ky: 0,
+      stun: 0,
+      style: entity.style ?? 0.9,
+      lane: entity.lane ?? 0,
+      wob: entity.wobble ?? 0,
+      lazy: 0,
+      lazyCd: 4,
+      aggro: 0,
+      aggroCd: 12,
+    };
+  }
+
+  private insideRect(x: number, y: number, rect: Rect, pad = 0): boolean {
+    return (
+      x > rect.x - pad &&
+      x < rect.x + rect.w + pad &&
+      y > rect.y - pad &&
+      y < rect.y + rect.h + pad
+    );
   }
 
   /** бак, деньги, канистры и разложенные по городу канистры — в исходное состояние */
@@ -541,8 +913,14 @@ export class CityRideGame {
     if (this.phase === "play") {
       // Таймауты билбордов идут по реальному времени, в том числе пока открыто
       // окно клиента или карта и основная симуляция поставлена на паузу.
-      this.updateBillboards(dt);
+      if (!this.online) this.updateBillboards(dt);
       if (!this.paused) this.update(dt);
+      // Серверные данные вливаются в картинку каждый кадр — в том числе на
+      // паузе, когда своё предсказание не крутится.
+      if (this.online?.connected) {
+        this.reconcilePrediction(dt);
+        this.updateRemoteEntities(dt);
+      }
     }
     this.render(dt);
   };
@@ -559,7 +937,128 @@ export class CityRideGame {
     }
   }
 
+  private updateOnline(dt: number): void {
+    const transport = this.online;
+    if (!transport?.connected) return;
+
+    this.time += dt;
+    this.bumpCd -= dt;
+    this.leafCd -= dt;
+    this.crashCd -= dt;
+    this.onlineInputCd -= dt;
+
+    const up = this.keys.has("up") && !this.stalled;
+    const down = this.keys.has("down");
+    const left = this.keys.has("left");
+    const right = this.keys.has("right");
+    const handbrake = this.keys.has("hb");
+
+    if (this.onlineInputCd <= 0) {
+      transport.sendInput({ up, down, left, right, handbrake });
+      this.onlineInputCd = 1 / 30;
+    }
+
+    // Движение считаем сами, кадр в кадр: сеть нужна лишь для того, чтобы
+    // время от времени поправить результат — это делает reconcilePrediction().
+    let throttle = 0;
+    if (this.refueling || this.onlinePlayerStatus !== "active") {
+      // под колонкой и после вылета машина стоит: предсказывать нечего
+      this.car.speed = 0;
+      this.braking = false;
+      this.prevWheelL = this.prevWheelR = null;
+    } else {
+      throttle = this.stepCar(dt, false);
+    }
+
+    const speed = Math.abs(this.car.speed);
+    this.displaySpeed += (speed - this.displaySpeed) * Math.min(1, 10 * dt);
+    this.topSpeed = Math.max(this.topSpeed, speed);
+    this.updateParticles(dt);
+    this.fadeSkids(dt);
+    this.updateOnlineInteractions();
+    this.updateNearbyInactiveStation();
+
+    if (this.stalled || this.onlinePlayerStatus !== "active") {
+      sfx.engineIdle();
+    } else {
+      sfx.engine(speed / this.getPlayerMaxSpeed(), throttle);
+    }
+
+    if (
+      this.fuel <= 0 &&
+      speed < 24 &&
+      this.onlinePlayerStatus === "active" &&
+      !this.gameOverSent
+    ) {
+      this.gameOverSent = true;
+      transport.playerLost("fuel-empty");
+      this.cb.onGameOver({ time: this.time, found: this.found });
+    }
+    this.emitHud();
+  }
+
+  private updateOnlineInteractions(): void {
+    const transport = this.online;
+    if (!transport?.connected || this.onlinePlayerStatus !== "active") return;
+
+    const contacts = new Set<string>();
+    const touchRect = (rect: Rect, pad = CAR_R + 2) => {
+      const closestX = clamp(this.car.x, rect.x, rect.x + rect.w);
+      const closestY = clamp(this.car.y, rect.y, rect.y + rect.h);
+      return Math.hypot(this.car.x - closestX, this.car.y - closestY) <= pad;
+    };
+
+    for (const canister of this.city.canisters) {
+      if (canister.taken || !canister.id) continue;
+      if (Math.hypot(this.car.x - canister.x, this.car.y - canister.y) > CAR_R + CANISTER_R) continue;
+      const key = `canister:${canister.id}`;
+      contacts.add(key);
+      if (!this.onlineContacts.has(key)) {
+        transport.interact("canister", canister.id);
+      }
+    }
+
+    for (const station of this.city.stations) {
+      if (!station.id || !this.insideRect(this.car.x, this.car.y, station, 6)) continue;
+      const key = `station:${station.id}`;
+      contacts.add(key);
+      if (!this.onlineContacts.has(key) && station.state === "active") {
+        transport.interact("station", station.id);
+      }
+    }
+
+    for (const billboard of this.city.billboards) {
+      if (!billboard.id || !touchRect(billboard)) continue;
+      const key = `billboard:${billboard.id}`;
+      contacts.add(key);
+      if (this.onlineContacts.has(key) || billboard.state !== "ready") continue;
+      if (!this.hasInactiveStations()) {
+        this.cb.onBillboardUnavailable();
+        continue;
+      }
+      transport.interact("billboard", billboard.id);
+      this.cb.onDiscover(billboard.client, this.city.billboards.indexOf(billboard) + 1);
+      sfx.chime();
+    }
+
+    const base = this.city.base;
+    if (base.id && this.insideRect(this.car.x, this.car.y, base, 6)) {
+      const key = `base:${base.id}`;
+      contacts.add(key);
+      if (!this.onlineContacts.has(key) && this.fuel >= 0.5) {
+        this.cb.onBase(this.fuel, CONFIG.fuelSellPrice);
+      }
+    }
+
+    this.onlineContacts = contacts;
+  }
+
   private update(dt: number): void {
+    if (this.online?.connected) {
+      this.updateOnline(dt);
+      return;
+    }
+
     this.time += dt;
     this.leaderboardCd -= dt;
     this.bumpCd -= dt;
@@ -588,6 +1087,37 @@ export class CityRideGame {
       return;
     }
 
+    const throttle = this.stepCar(dt, true);
+
+    this.checkBase();
+    this.updateFuel(dt);
+    this.updateBots(dt);
+    this.carCollisions(dt);
+    this.coolCanisters(dt);
+    this.pickCanisters();
+    this.updateNearbyInactiveStation();
+    this.updateParticles(dt);
+    this.fadeSkids(dt);
+
+    const sp = Math.abs(c.speed);
+    this.topSpeed = Math.max(this.topSpeed, sp);
+    this.displaySpeed += (sp - this.displaySpeed) * Math.min(1, 8 * dt);
+
+    if (this.stalled) sfx.engineIdle();
+    else sfx.engine(sp / maxSpeed, throttle);
+    this.maybeEmitLeaderboard();
+    this.emitHud();
+  }
+
+  /**
+   * Физика кузова игрока за кадр: газ, тормоз, руль, снос на траве, следы юза и
+   * упор в стены. В онлайне это же и есть локальное предсказание — движение
+   * рисуется сразу, не дожидаясь снапшота, а расхождение потом гасит
+   * reconcilePrediction(). Возвращает текущую «долю газа» для звука мотора.
+   */
+  private stepCar(dt: number, interactive: boolean): number {
+    const c = this.car;
+    const maxSpeed = this.getPlayerMaxSpeed();
     const up = this.keys.has("up");
     const down = this.keys.has("down");
     const left = this.keys.has("left");
@@ -676,24 +1206,8 @@ export class CityRideGame {
     }
 
     this.applyKnock(dt);
-    this.collide();
-    this.checkBase();
-    this.updateFuel(dt);
-    this.updateBots(dt);
-    this.carCollisions(dt);
-    this.coolCanisters(dt);
-    this.pickCanisters();
-    this.updateNearbyInactiveStation();
-    this.updateParticles(dt);
-    this.fadeSkids(dt);
-
-    this.topSpeed = Math.max(this.topSpeed, sp);
-    this.displaySpeed += (sp - this.displaySpeed) * Math.min(1, 8 * dt);
-
-    if (this.stalled) sfx.engineIdle();
-    else sfx.engine(sp / maxSpeed, throttle);
-    this.maybeEmitLeaderboard();
-    this.emitHud();
+    this.collide(interactive);
+    return throttle;
   }
 
   private maybeEmitLeaderboard(): void {
@@ -780,6 +1294,11 @@ export class CityRideGame {
     // за один визит можно слить не более половины текущего топлива.
     const sold = clamp(liters, 0, this.fuel / 2);
     if (sold <= 0) return 0;
+    if (this.online?.connected) {
+      const id = this.city.base.id;
+      if (!id || this.online.interact("base", id, sold) === null) return 0;
+      return Math.round(sold * CONFIG.fuelSellPrice);
+    }
     this.fuel -= sold;
     const paid = Math.round(sold * CONFIG.fuelSellPrice);
     this.money += paid;
@@ -1347,7 +1866,11 @@ export class CityRideGame {
     return this.city.roadCenters.some((c) => Math.abs(x - c) < ROAD / 2 || Math.abs(y - c) < ROAD / 2);
   }
 
-  private collide(): void {
+  /**
+   * Упор в стены и щиты. `interactive` включает локальную выдачу щита: в онлайне
+   * это решает сервер (updateOnlineInteractions), а здесь остаётся только физика.
+   */
+  private collide(interactive = true): void {
     const c = this.car;
     let hit = false;
     let billboardContact: Billboard | null = null;
@@ -1360,13 +1883,13 @@ export class CityRideGame {
         billboardContact = b;
         // Повторное взаимодействие возможно, но только после того, как игрок
         // отъехал от щита и снова в него въехал.
-        if (this.billboardContact !== b && b.state === "ready") {
+        if (interactive && this.billboardContact !== b && b.state === "ready") {
           if (this.hasInactiveStations()) this.discover(b);
           else this.cb.onBillboardUnavailable();
         }
       }
     }
-    this.billboardContact = billboardContact;
+    if (interactive) this.billboardContact = billboardContact;
     // деревья (мягко, по «стволу»)
     for (const t of this.city.trees) {
       const dx = c.x - t.x;
