@@ -7,6 +7,7 @@ interface RefuelingVoice {
 const REFUELING_VOLUME = 0.6;
 const REFUELING_FADE_TIME = 0.12;
 const GASOLINE_SALE_VOLUME = 0.7;
+const CANISTER_PICKUP_VOLUME = 0.7;
 
 /** WebAudio-эффекты игры: синтезатор и зацикленные записи заправки. */
 class Sfx {
@@ -28,9 +29,14 @@ class Sfx {
     new URL("../sound/effects/refueling/Refueling1.mp3", import.meta.url).href,
     new URL("../sound/effects/refueling/Refueling2.mp3", import.meta.url).href,
   ];
-  private saleBuffer: AudioBuffer | null = null;
-  private saleLoad: Promise<void> | null = null;
+  /** одиночные записи: декодированный буфер и незавершённая загрузка на файл */
+  private samples = new Map<string, AudioBuffer>();
+  private sampleLoads = new Map<string, Promise<void>>();
   private readonly saleFile = new URL("../sound/effects/gasoline_sales.mp3", import.meta.url).href;
+  private readonly canisterPickupFile = new URL(
+    "../sound/effects/obtaining_an_empty_canister.mp3",
+    import.meta.url
+  ).href;
 
   init(): void {
     try {
@@ -45,7 +51,8 @@ class Sfx {
       }
       if (this.ac.state === "suspended") void this.ac.resume();
       this.loadRefuelingBuffers();
-      void this.loadSaleBuffer();
+      void this.loadSample(this.saleFile);
+      void this.loadSample(this.canisterPickupFile);
     } catch {
       this.ac = null;
     }
@@ -295,49 +302,61 @@ class Sfx {
 
   /** игрок слил бензин на базе — запись кассы приёмщика */
   gasolineSale(): void {
+    this.playSample(this.saleFile, GASOLINE_SALE_VOLUME);
+  }
+
+  /** игрок подобрал канистру с карты */
+  canisterPickup(): void {
+    this.playSample(this.canisterPickupFile, CANISTER_PICKUP_VOLUME);
+  }
+
+  private playSample(file: string, volume: number): void {
     if (!this.ac) return;
-    if (this.saleBuffer) {
-      this.playSaleBuffer();
+    if (this.samples.has(file)) {
+      this.playSampleBuffer(file, volume);
       return;
     }
-    // Первый слив может прийтись на ещё не загруженную запись: доигрываем её,
-    // как только декодирование закончится.
+    // Первое срабатывание может прийтись на ещё не загруженную запись:
+    // доигрываем её, как только декодирование закончится.
     const ac = this.ac;
-    void this.loadSaleBuffer().then(() => {
-      if (this.ac === ac) this.playSaleBuffer();
+    void this.loadSample(file).then(() => {
+      if (this.ac === ac) this.playSampleBuffer(file, volume);
     });
   }
 
-  private loadSaleBuffer(): Promise<void> {
+  private loadSample(file: string): Promise<void> {
     const ac = this.ac;
-    if (!ac || this.saleBuffer) return Promise.resolve();
-    if (this.saleLoad) return this.saleLoad;
+    if (!ac || this.samples.has(file)) return Promise.resolve();
+    const pending = this.sampleLoads.get(file);
+    if (pending) return pending;
 
-    this.saleLoad = (async () => {
+    const load = (async () => {
       try {
-        const response = await fetch(this.saleFile);
+        const response = await fetch(file);
         if (!response.ok) return;
         const buffer = await ac.decodeAudioData(await response.arrayBuffer());
-        if (this.ac === ac) this.saleBuffer = buffer;
+        if (this.ac === ac) this.samples.set(file, buffer);
       } catch {
         /* тишина */
       }
     })().finally(() => {
-      this.saleLoad = null;
+      this.sampleLoads.delete(file);
     });
 
-    return this.saleLoad;
+    this.sampleLoads.set(file, load);
+    return load;
   }
 
-  private playSaleBuffer(): void {
+  private playSampleBuffer(file: string, volume: number): void {
     const ac = this.ac;
     const master = this.master;
-    if (!ac || !master || !this.saleBuffer) return;
+    const buffer = this.samples.get(file);
+    if (!ac || !master || !buffer) return;
     try {
       const source = ac.createBufferSource();
-      source.buffer = this.saleBuffer;
+      source.buffer = buffer;
       const gain = ac.createGain();
-      gain.gain.value = GASOLINE_SALE_VOLUME;
+      gain.gain.value = volume;
       source.connect(gain);
       gain.connect(master);
       source.onended = () => {
