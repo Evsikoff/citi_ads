@@ -62,7 +62,11 @@ export interface GameCallbacks {
   onBillboardUnavailable(): void;
   onStationUnlock(active: number, total: number, origin: "timer" | "ad"): void;
   onStationLock(active: number, total: number): void;
-  onInactiveStationNearby(nearby: boolean): void;
+  /**
+   * Рядом закрытая АЗС. `inReach` — машина уже на её площадке, то есть
+   * достаточно близко, чтобы сервер принял активацию.
+   */
+  onInactiveStationNearby(nearby: boolean, inReach: boolean): void;
   onCanister(count: number, liters: number): void;
   onCanisterLost(count: number, left: number): void;
   /** заправка прервалась не из-за полного бака */
@@ -70,6 +74,16 @@ export interface GameCallbacks {
   /** машина заехала на базу нелегальной скупки — игроку предлагают продать бензин */
   onBase(fuel: number, price: number): void;
 }
+
+/**
+ * Что вышло из попытки активировать закрытую АЗС бустером. `pending` — запрос
+ * ушёл на сервер, и до его ответа бустер ещё не потрачен.
+ */
+export type StationActivation =
+  | { status: "activated" }
+  | { status: "pending"; requestId: string }
+  | { status: "too-far" }
+  | { status: "unavailable" };
 
 type ParticleKind = "smoke" | "spark" | "confetti" | "leaf";
 
@@ -134,6 +148,12 @@ const PLAYERS = 1 + CONFIG.botCount; // участников заезда: иг�
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
 const CANISTER_L = CONFIG.canisterTankBonus;
 const INACTIVE_STATION_PROXIMITY = 120; // расстояние от края площадки для показа контекстного бустера
+// А вот активацию сервер принимает только у самой площадки: у него свой радиус,
+// и на дальнем нажатии он отвечает «too-far», а бустер уже потрачен. Просим
+// заехать на площадку — с этого места сервер сам начинает заправку на открытой
+// АЗС, значит станцию рядом с собой он там точно видит. Допуск тот же, что и у
+// заправки.
+const INACTIVE_STATION_REACH = 6;
 const REFUELING_HEARING_DISTANCE = 800; // дальше этого расстояния чужую АЗС не слышно
 // T = базовый таймаут + надбавка за каждую канистру, оба значения из config.ts
 const refuelDuration = (canisters: number): number =>
@@ -270,6 +290,7 @@ export class CityRideGame {
   private refuelStation: Station | null = null; // где сейчас идёт заправка
   private usedStation: Station | null = null; // площадка, с которой ещё не съехали после заправки
   private nearbyInactiveStation: Station | null = null;
+  private nearbyStationInReach = false;
   // очередь отложенных открытий: каждая занятая колонка через T секунд открывает другую
   private unlockQueue: Array<{ t: number; from: Station; notify: boolean }> = [];
   private bots: Bot[] = [];
@@ -762,19 +783,34 @@ export class CityRideGame {
     return { applied: false, revived: false };
   }
 
-  /** Активирует именно ту закрытую АЗС, рядом с которой сейчас находится игрок. */
-  activateNearbyInactiveStation(): boolean {
+  /**
+   * Активирует именно ту закрытую АЗС, рядом с которой сейчас находится игрок.
+   * В онлайне решение за сервером, поэтому здесь возвращается только номер
+   * запроса: списывать бустер можно лишь после ответа `interaction:result`.
+   */
+  activateNearbyInactiveStation(): StationActivation {
     const station = this.nearbyInactiveStation;
     if (!station || station.state !== "locked") {
       this.updateNearbyInactiveStation();
-      return false;
+      return { status: "unavailable" };
+    }
+    if (this.online?.connected && !this.nearbyStationInReach) {
+      // Сервер проверяет расстояние сам: отправить запрос с этой дистанции —
+      // значит получить «too-far» в ответ, уже потратив бустер.
+      return { status: "too-far" };
     }
     if (this.online?.connected) {
-      return !!station.id && this.online.interact("station", station.id) !== null;
+      if (!station.id) return { status: "unavailable" };
+      // Сервер сверяет расстояние по последнему player:move, а он уходит 20 раз
+      // в секунду и на скорости успевает отстать на полкорпуса. Досылаем
+      // текущую позицию перед проверкой.
+      this.pushPositionToServer();
+      const requestId = this.online.interact("station", station.id);
+      return requestId ? { status: "pending", requestId } : { status: "unavailable" };
     }
     const activated = this.activateStation(station, "ad", true);
     if (activated) this.setNearbyInactiveStation(null);
-    return activated;
+    return activated ? { status: "activated" } : { status: "unavailable" };
   }
 
   reset(): void {
@@ -1194,6 +1230,19 @@ export class CityRideGame {
     }
   }
 
+  /**
+   * Отправляет серверу текущее положение машины. Вызывается по таймеру из
+   * updateOnline и внеочередно перед запросами, где сервер сверяет дистанцию.
+   */
+  private pushPositionToServer(): void {
+    const transport = this.online;
+    if (!transport?.connected || this.moveDisabled) return;
+    if (this.refueling || this.onlinePlayerStatus !== "active") return;
+    const c = this.car;
+    transport.sendMove({ x: c.x, y: c.y, angle: c.angle, speed: c.speed });
+    this.onlineMoveCd = 1 / MOVE_SEND_RATE;
+  }
+
   private updateOnline(dt: number): void {
     const transport = this.online;
     if (!transport?.connected) return;
@@ -1220,16 +1269,7 @@ export class CityRideGame {
     // Положение своей машины ведёт клиент, поэтому его надо не только нарисовать,
     // но и сообщить: по этим координатам сервер считает столкновения и показывает
     // нас остальным. Под колонкой машину держит он сам — там молчим.
-    if (
-      this.onlineMoveCd <= 0 &&
-      !this.moveDisabled &&
-      !this.refueling &&
-      this.onlinePlayerStatus === "active"
-    ) {
-      const c = this.car;
-      transport.sendMove({ x: c.x, y: c.y, angle: c.angle, speed: c.speed });
-      this.onlineMoveCd = 1 / MOVE_SEND_RATE;
-    }
+    if (this.onlineMoveCd <= 0) this.pushPositionToServer();
 
     // Движение считаем сами, кадр в кадр: сеть нужна лишь там, где сервер
     // главный, и это разбирает applyServerPosition().
@@ -2126,10 +2166,12 @@ export class CityRideGame {
     }
   }
 
-  private setNearbyInactiveStation(station: Station | null): void {
-    if (this.nearbyInactiveStation === station) return;
+  private setNearbyInactiveStation(station: Station | null, inReach = false): void {
+    const reach = station !== null && inReach;
+    if (this.nearbyInactiveStation === station && this.nearbyStationInReach === reach) return;
     this.nearbyInactiveStation = station;
-    this.cb.onInactiveStationNearby(station !== null);
+    this.nearbyStationInReach = reach;
+    this.cb.onInactiveStationNearby(station !== null, reach);
   }
 
   private updateNearbyInactiveStation(): void {
@@ -2156,7 +2198,7 @@ export class CityRideGame {
         nearest = station;
       }
     }
-    this.setNearbyInactiveStation(nearest);
+    this.setNearbyInactiveStation(nearest, nearestDistance <= INACTIVE_STATION_REACH);
   }
 
   private activateStation(
