@@ -1723,6 +1723,7 @@ export class CityRideGame {
     if (this.online?.connected) {
       const id = this.city.base.id;
       if (!id || this.online.interact("base", id, sold) === null) return 0;
+      sfx.gasolineSale();
       return Math.round(sold * CONFIG.fuelSellPrice);
     }
     this.fuel -= sold;
@@ -1733,6 +1734,7 @@ export class CityRideGame {
       this.spawn(b.x + b.w / 2, b.y + b.h / 2, "confetti", i % 2 ? "#ffd27a" : "#7ee08a", 0.9, 240);
     }
     sfx.chime();
+    sfx.gasolineSale();
     this.emitHud();
     return paid;
   }
