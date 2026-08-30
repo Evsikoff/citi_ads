@@ -115,9 +115,10 @@ const REMOTE_EXTRAPOLATE_S = 0.35; // сколько продлеваем чуж
 const PLAYERS = 1 + CONFIG.botCount; // участников заезда: игрок и боты
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
 const CANISTER_L = 10; // на столько литров канистра увеличивает бак
-const REFUEL_RATE = 10; // л/с на работающей АЗС
 const INACTIVE_STATION_PROXIMITY = 120; // расстояние от края площадки для показа контекстного бустера
 // T = базовый таймаут + надбавка за каждую канистру, оба значения из config.ts
+const refuelDuration = (canisters: number): number =>
+  Math.max(0, CONFIG.stationTimeoutBase + CONFIG.stationTimeoutPerCanister * Math.max(0, canisters));
 const M_PER_PX = 0.35; // метров в мировом пикселе — для подписей с дистанцией
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
@@ -241,6 +242,10 @@ export class CityRideGame {
   private fuelConsumptionMultiplier = 1;
   private sessionLiters = 0; // сколько литров налили на этой колонке
   private sessionSpent = 0; // и сколько рублей за них отдали
+  private sessionTargetLiters = 0; // сколько всего можно налить за текущий визит
+  private sessionDuration = 0; // длительность визита по формуле из config.ts
+  private sessionElapsed = 0;
+  private sessionStop: "full" | "limit" | "money" = "full";
   private totalLitersFilled = 0; // рейтинг: все литры, залитые игроком за текущий заезд
   private playerName = makePlayerName();
   private leaderboardCd = 0;
@@ -282,6 +287,10 @@ export class CityRideGame {
   private serverError = { x: 0, y: 0, angle: 0, speed: 0 };
   // Чужие машины и боты: отрисовка отдельно от того, что прислал сервер.
   private remoteEntities = new Map<string, RemoteEntity>();
+  // После серверного тарана не интерполируем старое положение: офлайн-физика
+  // тоже применяет расталкивание и отскок в тот же кадр.
+  private collisionSnapEntities = new Set<string>();
+  private collisionSnapPlayer = false;
 
   private onKeyDown: (e: KeyboardEvent) => void;
   private onKeyUp: (e: KeyboardEvent) => void;
@@ -374,6 +383,8 @@ export class CityRideGame {
     this.onlineInputCd = 0;
     this.onlineContacts.clear();
     this.remoteEntities.clear();
+    this.collisionSnapEntities.clear();
+    this.collisionSnapPlayer = false;
     this.resetServerError();
     if (!transport) {
       this.onlinePlayerId = null;
@@ -421,7 +432,12 @@ export class CityRideGame {
     for (const entity of entities) {
       const bot = this.toRenderBot(entity);
       const known = this.remoteEntities.get(entity.id);
-      if (known && Math.hypot(entity.x - known.bot.x, entity.y - known.bot.y) <= REMOTE_SNAP) {
+      const collisionSnap = this.collisionSnapEntities.has(entity.id);
+      if (
+        known &&
+        !collisionSnap &&
+        Math.hypot(entity.x - known.bot.x, entity.y - known.bot.y) <= REMOTE_SNAP
+      ) {
         bot.x = known.bot.x;
         bot.y = known.bot.y;
         bot.angle = known.bot.angle;
@@ -435,6 +451,7 @@ export class CityRideGame {
         speed: entity.speed,
         age: 0,
       });
+      this.collisionSnapEntities.delete(entity.id);
     }
     this.remoteEntities = next;
     this.bots = [...next.values()].map((entity) => entity.bot);
@@ -470,6 +487,13 @@ export class CityRideGame {
       !!this.onlinePlayerId &&
       ((event.rammerIsPlayer && event.rammerId === this.onlinePlayerId) ||
         (event.victimIsPlayer && event.victimId === this.onlinePlayerId));
+
+    // Следующий принудительный снимок сервер отправляет сразу после события.
+    // Применяем его без обычного сетевого сглаживания, иначе визуальные кузова
+    // ещё несколько кадров проходят друг сквозь друга после уже случившегося удара.
+    if (event.rammerId !== this.onlinePlayerId) this.collisionSnapEntities.add(event.rammerId);
+    if (event.victimId !== this.onlinePlayerId) this.collisionSnapEntities.add(event.victimId);
+    if (mine) this.collisionSnapPlayer = true;
 
     this.crashEffects(event.x, event.y, event.force, mine);
     if (!mine) return;
@@ -822,12 +846,13 @@ export class CityRideGame {
       !!this.online?.connected;
     const drift = Math.hypot(player.x - c.x, player.y - c.y);
 
-    if (!predicting || drift > RECONCILE_SNAP) {
+    if (this.collisionSnapPlayer || !predicting || drift > RECONCILE_SNAP) {
       c.x = player.x;
       c.y = player.y;
       c.angle = player.angle;
       c.speed = player.speed;
       this.resetServerError();
+      this.collisionSnapPlayer = false;
       return;
     }
 
@@ -913,6 +938,10 @@ export class CityRideGame {
     this.fuelConsumptionMultiplier = 1;
     this.sessionLiters = 0;
     this.sessionSpent = 0;
+    this.sessionTargetLiters = 0;
+    this.sessionDuration = 0;
+    this.sessionElapsed = 0;
+    this.sessionStop = "full";
     this.totalLitersFilled = 0;
     this.playerName = makePlayerName();
     this.leaderboardCd = 0;
@@ -1683,7 +1712,7 @@ export class CityRideGame {
 
   private updateBots(dt: number): void {
     for (const b of this.bots) {
-      const step = stepBot(b, this.city, dt, this.car);
+      const step = stepBot(b, this.city, dt, this.car, refuelDuration(b.taken));
       this.keepBotOutOfWalls(b);
       if (step.took) {
         for (let i = 0; i < 12; i++) {
@@ -1793,8 +1822,9 @@ export class CityRideGame {
       this.unlockQueue.splice(i, 1);
       this.unlockRandom("timer", q.notify, q.from);
     }
-    // заправка: начинаем только на работающей АЗС, но начатую сессию доводим до
-    // полного бака — колонка блокируется сразу, как только к ней встали
+    // Заправка начинается только на работающей АЗС. Доступный объём (место в
+    // баке, лимит колонки и деньги) плавно наливается ровно за T из config.ts:
+    // базовое время на машину + время на каждую канистру.
     let at: Station | null = null;
     if (!this.stalled) {
       for (const s of this.city.stations) {
@@ -1808,31 +1838,40 @@ export class CityRideGame {
     // иначе долитый до полного бак сразу тратит пару капель и заправка
     // начинается заново, а машина остаётся заблокированной навсегда
     const canStart = !!at && at.state === "active" && at !== this.usedStation;
-    const canGo = !!at && at === this.refuelStation;
-    // сколько литров реально можем взять на этом кадре: место в баке, лимит
-    // колонки и деньги в кармане — что первым закончится, то и остановит
-    let step = 0;
-    let stop: "limit" | "money" | null = null;
-    if (at && (canStart || canGo)) {
-      const poured = canGo ? this.sessionLiters : 0;
+
+    if (at && canStart && !this.refueling) {
       const room = this.fuelMax - this.fuel;
-      const allowance = at.limit === null ? Infinity : Math.max(0, at.limit - poured);
+      const allowance = at.limit === null ? Infinity : Math.max(0, at.limit);
       const affordable = at.price > 0 ? this.money / at.price : Infinity;
-      step = Math.min(REFUEL_RATE * dt, room, allowance, affordable);
-      if (step <= 0.0005 && room > 0.05) stop = allowance <= 0.0005 ? "limit" : "money";
-    }
-    if (at && (canStart || canGo) && step > 0.0005) {
-      if (!this.refueling) {
+      const target = Math.max(0, Math.min(room, allowance, affordable));
+      if (target > 0.0005) {
         // машина клюнула носом и встала под колонку — колонка занята
         this.refuelStation = at;
         this.sessionLiters = 0;
         this.sessionSpent = 0;
+        this.sessionTargetLiters = target;
+        this.sessionDuration = refuelDuration(this.canisters);
+        this.sessionElapsed = 0;
+        this.sessionStop =
+          room <= target + 0.0005 ? "full" : allowance <= target + 0.0005 ? "limit" : "money";
+        this.refueling = true;
         this.takeStation(at, this.canisters, true);
         this.cam.shake = Math.min(12, this.cam.shake + Math.abs(c.speed) / 90);
         for (let i = 0; i < 8; i++) {
           this.spawn(c.x, c.y, "smoke", "rgba(150,160,178,0.35)", 0.7, 40);
         }
       }
+    }
+
+    if (this.refueling && at && at === this.refuelStation) {
+      const duration = Math.max(0, this.sessionDuration);
+      const nextElapsed = duration <= 0 ? duration : Math.min(duration, this.sessionElapsed + dt);
+      const desiredLiters =
+        duration <= 0
+          ? this.sessionTargetLiters
+          : this.sessionTargetLiters * (nextElapsed / duration);
+      const step = Math.max(0, Math.min(this.sessionTargetLiters - this.sessionLiters, desiredLiters - this.sessionLiters));
+      this.sessionElapsed = nextElapsed;
       const was = this.fuel;
       this.fuel = Math.min(this.fuelMax, this.fuel + step);
       const paid = (this.fuel - was) * at.price;
@@ -1842,7 +1881,6 @@ export class CityRideGame {
       this.totalLitersFilled += filled;
       if (filled > 0) this.leaderboardDirty = true;
       this.sessionSpent += paid;
-      this.refueling = true;
       this.refuelSndCd -= dt;
       if (this.refuelSndCd <= 0) {
         sfx.blip();
@@ -1857,21 +1895,32 @@ export class CityRideGame {
           this.spawn(c.x, c.y - 10, "confetti", i % 2 ? "#7ee08a" : "#ffe08a", 0.9, 300);
         }
       }
-    } else {
-      if (this.refueling && stop) this.cb.onRefuelStop(stop);
+
+      const complete =
+        this.sessionLiters >= this.sessionTargetLiters - 0.0005 ||
+        duration <= 0 ||
+        this.sessionElapsed >= duration;
+      if (!complete) {
+        // предупреждение о низком баке во время заправки не проигрываем
+        return;
+      }
+
+      if (this.sessionStop !== "full") this.cb.onRefuelStop(this.sessionStop);
       const completedStation = this.refuelStation;
       this.refueling = false;
       this.refuelStation = null;
-      // Помечаем площадку использованной только после реальной заправки либо
-      // если подъехали к активной колонке с уже полным баком. Простой заезд на
-      // закрытую АЗС не должен скрывать контекстный бустер.
-      if (completedStation) {
-        this.usedStation = completedStation;
-      } else if (this.usedStation) {
-        if (at !== this.usedStation) this.usedStation = null;
-      } else if (at?.state === "active") {
-        this.usedStation = at;
-      }
+      this.usedStation = completedStation;
+    } else if (this.refueling) {
+      // За обычной ездой уйти нельзя: управление на время обслуживания
+      // заблокировано. Ветка нужна для замены карты или внешнего телепорта.
+      this.refueling = false;
+      this.usedStation = this.refuelStation;
+      this.refuelStation = null;
+    } else if (this.usedStation) {
+      if (at !== this.usedStation) this.usedStation = null;
+    } else if (at?.state === "active") {
+      // Полный бак: площадка использована, пока машина с неё не съедет.
+      this.usedStation = at;
     }
     // предупреждение о низком баке
     if (!this.stalled && this.fuel < this.fuelMax * 0.22 && this.fuel > 0) {
@@ -1884,9 +1933,10 @@ export class CityRideGame {
   }
 
   /**
-   * К колонке встала машина: АЗС блокируется сразу, а через T = 2 + канистры
-   * секунд откроется другая случайная. Станция, открытая за рекламу, цепочку
-   * не запускает. notify — показывать ли игроку сообщения (для ботов молчим).
+   * К колонке встала машина: АЗС блокируется сразу, а через то же время T,
+   * которое занимает обслуживание машины, откроется другая случайная.
+   * Станция, открытая за рекламу, цепочку не запускает. notify — показывать ли
+   * игроку сообщения (для ботов молчим).
    */
   private takeStation(s: Station, canisters: number, notify: boolean): void {
     if (s.state !== "active") return;

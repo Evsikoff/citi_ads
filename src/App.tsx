@@ -1247,8 +1247,8 @@ export default function App() {
                   <span>
                     Бак — {CONFIG.startTankVolume} л, литр на АЗС стоит {CONFIG.stationPriceMin}–
                     {CONFIG.stationPriceMax} ₽, у каждой колонки цена своя, иногда с лимитом отпуска.
-                    Колонка закрывается, как только под неё встали; другая откроется через{" "}
-                    {CONFIG.stationTimeoutBase} с плюс {CONFIG.stationTimeoutPerCanister} с за канистру.
+                    Заправка бака занимает {CONFIG.stationTimeoutBase} с плюс{" "}
+                    {CONFIG.stationTimeoutPerCanister} с за канистру; после этого откроется другая колонка.
                     База на отшибе скупает бензин по {CONFIG.fuelSellPrice} ₽ — на этом и живём.
                   </span>
                 </div>

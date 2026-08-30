@@ -86,7 +86,6 @@ const BOT_R = 15; // радиус кузова
 const LANE_EPS = 60; // насколько близко к оси улицы считается «еду по ней»
 const FINAL_DIST = 190; // с этого расстояния к цели едем напрямую
 const DETOUR = 260; // цель считается «по пути», если она не дальше этого от маршрута
-const REFUEL_S = 2.4; // сколько бот стоит под колонкой
 const SELL_S = 2; // сколько бот стоит на базе, пока сливает бензин
 const SELL_FROM = 2; // с этого количества канистр бот едет продавать
 const THINK_S = 0.25; // как часто пересчитывать цель
@@ -349,7 +348,13 @@ export function createBots(city: City, count: number, start: { x: number; y: num
   return bots;
 }
 
-export function stepBot(b: Bot, city: City, dt: number, player: { x: number; y: number }): BotStep {
+export function stepBot(
+  b: Bot,
+  city: City,
+  dt: number,
+  player: { x: number; y: number },
+  refuelSeconds: number
+): BotStep {
   const step: BotStep = { took: null, refuelAt: null, soldAt: null };
   applyKnock(b, dt);
   if (b.stun > 0) {
@@ -411,7 +416,7 @@ export function stepBot(b: Bot, city: City, dt: number, player: { x: number; y: 
   } else if (g.kind === "station") {
     const s = g.st;
     if (s.state === "active" && b.x > s.x - 6 && b.x < s.x + s.w + 6 && b.y > s.y - 6 && b.y < s.y + s.h + 6) {
-      b.wait = REFUEL_S;
+      b.wait = Math.max(0, refuelSeconds);
       b.at = s;
       b.refuelled = true;
       b.goal = null;
