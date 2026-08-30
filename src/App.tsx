@@ -146,6 +146,12 @@ export default function App() {
   const refuelPriceRef = useRef<HTMLSpanElement>(null);
   const refuelLimitRef = useRef<HTMLSpanElement>(null);
   const toastTimer = useRef<number>(0);
+  // Активация АЗС, отправленная на сервер: пока ответа нет, бустер не потрачен.
+  const pendingStationBooster = useRef<{
+    requestId: string;
+    boosterId: string;
+    timer: number;
+  } | null>(null);
   const boostersMenuRef = useRef<HTMLDivElement>(null);
 
   const [phase, setPhase] = useState<"loading" | "menu" | "play">("loading");
@@ -163,6 +169,9 @@ export default function App() {
   const [boosterBalance, setBoosterBalance] = useState(CONFIG.startMoney);
   const [boosterPurchases, setBoosterPurchases] = useState<Record<string, number>>({});
   const [inactiveStationNearby, setInactiveStationNearby] = useState(false);
+  // Машина заехала на площадку закрытой АЗС: только с такой дистанции сервер
+  // принимает активацию, поэтому дальше кнопка бустера заблокирована.
+  const [inactiveStationInReach, setInactiveStationInReach] = useState(false);
   const [touch] = useState(
     () => typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches
   );
@@ -236,7 +245,10 @@ export default function App() {
         ),
       onStationLock: (active, total) =>
         showToast(`Колонка занята — АЗС закрылась. Активных станций: ${active} из ${total}`),
-      onInactiveStationNearby: setInactiveStationNearby,
+      onInactiveStationNearby: (nearby, inReach) => {
+        setInactiveStationNearby(nearby);
+        setInactiveStationInReach(inReach);
+      },
       onCanister: (count, liters) =>
         showToast(`Канистра подобрана: бак вырос на ${liters} л (топливо не прибавилось). Канистр у тебя: ${count}`),
       onRefuelStop: (reason) =>
@@ -312,11 +324,14 @@ export default function App() {
         gameRef.current?.applyServerLeaderboard(rows);
       },
       onInteractionResult: (result) => {
-        gameRef.current?.applyInteractionResult(result);
-        if (!result.ok) showToast(serverMessage(result.code, result.message));
+        // Отказы по щитам движок разбирает сам (повтор, свой текст) — тогда
+        // дублировать их сообщением сервера не нужно.
+        const handled = gameRef.current?.applyInteractionResult(result);
+        resolveStationBooster(result.requestId, result.ok);
+        if (!result.ok && !handled) showToast(serverMessage(result.code, result.message));
       },
       onGameEventResult: (result) => {
-        gameRef.current?.applyInteractionResult(result);
+        const handled = gameRef.current?.applyInteractionResult(result);
         if (result.event === "booster-applied") {
           if (!result.ok) {
             showToast(
@@ -330,7 +345,7 @@ export default function App() {
           if (result.details?.revived) setGameover(null);
           return;
         }
-        if (!result.ok) showToast(serverMessage(result.code, result.message));
+        if (!result.ok && !handled) showToast(serverMessage(result.code, result.message));
       },
       onPlayerRespawned: (player) => {
         gameRef.current?.applyRespawn(player);
@@ -345,7 +360,16 @@ export default function App() {
           gameRef.current?.onServerMovementRejected();
           return;
         }
-        if (networkStatusRef.current === "online") showToast(serverMessage(error.code, error.message));
+        // Отказ мог прийти и ошибкой — тогда бустер тоже остаётся неистраченным,
+        // а запрос по щиту движок повторит сам.
+        let handled = false;
+        if (error.requestId) {
+          resolveStationBooster(error.requestId, false);
+          handled = !!gameRef.current?.applyRequestFailure(error.requestId, error.code);
+        }
+        if (!handled && networkStatusRef.current === "online") {
+          showToast(serverMessage(error.code, error.message));
+        }
       },
     });
     networkRef.current = network;
@@ -394,6 +418,8 @@ export default function App() {
     setBoosterBalance(CONFIG.startMoney);
     setBoosterPurchases({});
     setInactiveStationNearby(false);
+    setInactiveStationInReach(false);
+    dropPendingStationBooster();
     setPhase("play");
   };
 
@@ -409,6 +435,8 @@ export default function App() {
     setBoosterBalance(CONFIG.startMoney);
     setBoosterPurchases({});
     setInactiveStationNearby(false);
+    setInactiveStationInReach(false);
+    dropPendingStationBooster();
     showToast("Новая охота: билборды снова доступны, бак полный");
   };
 
@@ -452,6 +480,33 @@ export default function App() {
     );
   };
 
+  const countBoosterPurchase = (boosterId: string) => {
+    setBoosterPurchases((current) => ({
+      ...current,
+      [boosterId]: (current[boosterId] ?? 0) + 1,
+    }));
+  };
+
+  /** Отменяет ожидание ответа сервера — бустер при этом остаётся неистраченным. */
+  const dropPendingStationBooster = () => {
+    const pending = pendingStationBooster.current;
+    if (!pending) return;
+    window.clearTimeout(pending.timer);
+    pendingStationBooster.current = null;
+  };
+
+  /**
+   * Ответ сервера на активацию АЗС. Бустер списываем только если заправка
+   * действительно открылась: на отказ («Нужно подъехать ближе» и прочие) он
+   * остаётся у игрока, и попытку можно повторить.
+   */
+  const resolveStationBooster = (requestId: string | undefined, ok: boolean) => {
+    const pending = pendingStationBooster.current;
+    if (!pending || !requestId || pending.requestId !== requestId) return;
+    dropPendingStationBooster();
+    if (ok) countBoosterPurchase(pending.boosterId);
+  };
+
   const activateInactiveStationBooster = (booster: Booster) => {
     if (
       !inactiveStationNearby ||
@@ -459,16 +514,40 @@ export default function App() {
     ) {
       return;
     }
+    // Один запрос за раз: иначе двойное нажатие спишет бустер дважды за одну АЗС.
+    if (pendingStationBooster.current) return;
+    if (!inactiveStationInReach) {
+      showToast("Нужно подъехать ближе — заедь на площадку АЗС");
+      return;
+    }
     if (!executeExternalBoosterSale(booster)) {
       showToast("Не удалось выполнить действие — попробуй ещё раз");
       return;
     }
-    if (!gameRef.current?.activateNearbyInactiveStation()) return;
 
-    setBoosterPurchases((current) => ({
-      ...current,
-      [booster.id]: (current[booster.id] ?? 0) + 1,
-    }));
+    const request = gameRef.current?.activateNearbyInactiveStation();
+    if (!request || request.status === "unavailable") return;
+    if (request.status === "too-far") {
+      showToast("Нужно подъехать ближе — заедь на площадку АЗС");
+      return;
+    }
+    if (request.status === "activated") {
+      countBoosterPurchase(booster.id);
+      return;
+    }
+
+    // Онлайн: решение за сервером. Бустер спишем только на успешный ответ, а
+    // если ответа нет вовсе — просто перестанем его ждать.
+    pendingStationBooster.current = {
+      requestId: request.requestId,
+      boosterId: booster.id,
+      timer: window.setTimeout(() => {
+        if (pendingStationBooster.current?.requestId === request.requestId) {
+          pendingStationBooster.current = null;
+          showToast("Сервер не ответил — улучшение осталось при тебе");
+        }
+      }, 8000),
+    };
   };
 
   const toggleMute = () => {
@@ -528,6 +607,7 @@ export default function App() {
     mapOpen,
     boostersOpen,
     inactiveStationNearby,
+    inactiveStationInReach,
     boosterPurchases,
   ]);
 
@@ -879,10 +959,13 @@ export default function App() {
                       НА АЗС НЕТ ТОПЛИВА
                     </div>
                     <div className="mt-0.5 text-[10px] text-slate-500">
-                      Можно активировать эту заправку
+                      {inactiveStationInReach
+                        ? "Можно активировать эту заправку"
+                        : "Заедь на площадку — оттуда её можно активировать"}
                     </div>
                   </div>
                   {INACTIVE_STATION_BOOSTERS.length === 1 &&
+                    inactiveStationInReach &&
                     isBoosterWithinSessionLimit(
                       INACTIVE_STATION_BOOSTERS[0],
                       boosterPurchases
@@ -893,7 +976,10 @@ export default function App() {
                   {INACTIVE_STATION_BOOSTERS.map((booster) => {
                     const purchased = boosterPurchases[booster.id] ?? 0;
                     const maximum = getMaximumPurchases(booster);
-                    const available = isBoosterWithinSessionLimit(booster, boosterPurchases);
+                    const withinLimit = isBoosterWithinSessionLimit(booster, boosterPurchases);
+                    // Вне площадки сервер активацию не примет: держим кнопку
+                    // выключенной, чтобы бустер не сгорал впустую.
+                    const available = withinLimit && inactiveStationInReach;
 
                     return (
                       <button
@@ -918,7 +1004,11 @@ export default function App() {
                             )}
                           </span>
                           <span className="mt-1 block text-[10px] leading-tight text-slate-500">
-                            {available ? "Просмотреть рекламу" : "Лимит исчерпан"}
+                            {!withinLimit
+                              ? "Лимит исчерпан"
+                              : available
+                                ? "Просмотреть рекламу"
+                                : "Нужно подъехать ближе"}
                           </span>
                         </span>
                         <span className="shrink-0 self-start rounded bg-night-950/70 px-1.5 py-1 text-[9px] tabular-nums text-slate-500">
