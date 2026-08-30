@@ -20,6 +20,7 @@ class Sfx {
   private engineOn = false;
   muted = false;
   private wasMutedByBlur = false;
+  private listenersAttached = false;
   private refuelingBuffers: AudioBuffer[] = [];
   private refuelingLoadAttempted = false;
   private refuelingLoad: Promise<void> | null = null;
@@ -39,23 +40,14 @@ class Sfx {
   ).href;
 
   init(): void {
-    try {
-      if (!this.ac) {
-        const AC =
-          window.AudioContext ||
-          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        this.ac = new AC();
-        this.master = this.ac.createGain();
-        this.master.gain.value = this.muted ? 0 : 0.5;
-        this.master.connect(this.ac.destination);
-      }
-      if (this.ac.state === "suspended") void this.ac.resume();
+    if (this.ensureContext()) {
       this.loadRefuelingBuffers();
       void this.loadSample(this.saleFile);
       void this.loadSample(this.canisterPickupFile);
-    } catch {
-      this.ac = null;
     }
+
+    if (this.listenersAttached) return;
+    this.listenersAttached = true;
 
     // Слушаем потерю/восстановление фокуса вкладки
     document.addEventListener("visibilitychange", () => {
@@ -68,6 +60,33 @@ class Sfx {
 
     window.addEventListener("blur", () => this.handleBlur());
     window.addEventListener("focus", () => this.handleFocus());
+  }
+
+  /**
+   * Создаёт общий AudioContext (его же использует музыка) и будит его —
+   * браузер разрешает запуск только из обработчика жеста игрока.
+   */
+  ensureContext(): AudioContext | null {
+    try {
+      if (!this.ac) {
+        const AC =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        this.ac = new AC();
+        this.master = this.ac.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.5;
+        this.master.connect(this.ac.destination);
+      }
+      if (this.ac.state === "suspended") void this.ac.resume();
+    } catch {
+      this.ac = null;
+    }
+    return this.ac;
+  }
+
+  /** Уже созданный контекст — без попытки его открыть. */
+  get audioContext(): AudioContext | null {
+    return this.ac;
   }
 
   private handleBlur(): void {
