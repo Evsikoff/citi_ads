@@ -1,4 +1,6 @@
-/* Физика кузова — общая для машины игрока и для ботов, чтобы ездили одинаково. */
+/* Базовые размеры и скоростные настройки машин. */
+
+export { TopDownCarPhysics } from "./vendor/spacejack-car-physics.ts";
 
 export const MAX_SPEED = 640; // потолок скорости, px/с
 export const ACC = 540; // разгон, px/с²

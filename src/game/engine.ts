@@ -4,7 +4,7 @@ import type { Client } from "./clients";
 import { sfx } from "./audio";
 import { createBot, createBots, stepBot } from "./bots";
 import type { Bot } from "./bots";
-import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
+import { CAR_R, KMH, MAX_SPEED, TopDownCarPhysics } from "./car";
 import { CONFIG } from "./config";
 import { SnapshotTimeline, angleDelta, pushSample, sampleTimeline } from "./netclock";
 import type { RemoteSample } from "./netclock";
@@ -229,7 +229,7 @@ export class CityRideGame {
   private phase: "menu" | "play" = "menu";
   private paused = false;
 
-  private car = { x: 0, y: 0, angle: -Math.PI / 2, speed: 0, steer: 0 };
+  private car = new TopDownCarPhysics();
   private braking = false;
   private keys = new Set<string>();
 
@@ -912,10 +912,7 @@ export class CityRideGame {
     if (teleport) {
       // Вход в заезд, респавн, гибель, оффлайн: предсказывать тут нечего, и
       // мгновенный перенос здесь и есть правильная картинка.
-      c.x = player.x;
-      c.y = player.y;
-      c.angle = player.angle;
-      c.speed = player.speed;
+      c.reset(player.x, player.y, player.angle, player.speed);
       this.smoother.reset();
       this.reconcileBoost = 0;
       this.serverDisagreement = 0;
@@ -970,11 +967,11 @@ export class CityRideGame {
   /** подбирает расхождение с сервером понемногу каждый кадр */
   private reconcilePrediction(dt: number): void {
     if (this.reconcileBoost > 0) this.reconcileBoost = Math.max(0, this.reconcileBoost - dt);
-    const fix = this.smoother.advance(dt, Math.abs(this.car.speed), this.reconcileBoost > 0);
+    const fix = this.smoother.advance(dt, this.car.absoluteSpeed, this.reconcileBoost > 0);
     this.car.x += fix.dx;
     this.car.y += fix.dy;
     this.car.angle += fix.dAngle;
-    this.car.speed += fix.dSpeed;
+    this.car.addLongitudinalSpeed(fix.dSpeed);
   }
 
   private toRenderBot(entity: RemoteEntityState): Bot {
@@ -1065,10 +1062,7 @@ export class CityRideGame {
   }
 
   private placeCar(): void {
-    this.car.x = START.x;
-    this.car.y = START.y;
-    this.car.angle = -Math.PI / 2;
-    this.car.speed = 0;
+    this.car.reset(START.x, START.y, -Math.PI / 2);
     this.cam.x = this.car.x;
     this.cam.y = this.car.y;
   }
@@ -1239,7 +1233,7 @@ export class CityRideGame {
       throttle = this.stepCar(dt, false);
     }
 
-    const speed = Math.abs(this.car.speed);
+    const speed = this.car.absoluteSpeed;
     this.displaySpeed += (speed - this.displaySpeed) * Math.min(1, 10 * dt);
     this.topSpeed = Math.max(this.topSpeed, speed);
     this.updateParticles(dt);
@@ -1360,7 +1354,7 @@ export class CityRideGame {
     this.updateParticles(dt);
     this.fadeSkids(dt);
 
-    const sp = Math.abs(c.speed);
+    const sp = c.absoluteSpeed;
     this.topSpeed = Math.max(this.topSpeed, sp);
     this.displaySpeed += (sp - this.displaySpeed) * Math.min(1, 8 * dt);
 
@@ -1371,10 +1365,10 @@ export class CityRideGame {
   }
 
   /**
-   * Физика кузова игрока за кадр: газ, тормоз, руль, снос на траве, следы юза и
-   * упор в стены. В онлайне это же и есть локальное предсказание — движение
-   * рисуется сразу, не дожидаясь снапшота, а расхождение потом гасит
-   * reconcilePrediction(). Возвращает текущую «долю газа» для звука мотора.
+   * MIT-модель двухосевой динамики считает газ, тормоз, перенос веса, боковое
+   * сцепление и снос. Здесь к ней добавляются поверхности, следы юза и упор в
+   * стены. В онлайне это же локальное предсказание, а сетевое расхождение затем
+   * плавно гасит reconcilePrediction(). Возвращает долю газа для звука мотора.
    */
   private stepCar(dt: number, interactive: boolean): number {
     const c = this.car;
@@ -1384,55 +1378,54 @@ export class CityRideGame {
     const left = this.keys.has("left");
     const right = this.keys.has("right");
     const hb = this.keys.has("hb");
-    let throttle = 0;
-
-    if (up && !this.stalled) {
-      c.speed += ACC * dt;
-      throttle = 1;
-    }
+    const onRoad = this.isOnRoad(c.x, c.y);
+    const dir = (left ? -1 : 0) + (right ? 1 : 0);
+    let throttle = up && !this.stalled ? 1 : 0;
+    let brake = 0;
     if (down) {
-      if (c.speed > 1) {
-        c.speed -= BRAKE * dt;
+      if (c.speed > 12 || (c.speed > -12 && c.absoluteSpeed > 40)) {
+        throttle = 0;
+        brake = 1;
         this.braking = true;
       } else if (!this.stalled) {
-        c.speed -= ACC * 0.55 * dt;
-        this.braking = false;
-        throttle = 0.5;
-      } else {
+        throttle = -0.55;
         this.braking = false;
       }
     } else {
       this.braking = false;
     }
-    if (!up && !down) {
-      const s = c.speed;
-      c.speed = s - Math.sign(s) * Math.min(Math.abs(s), (55 + Math.abs(s) * 0.85) * dt);
-    }
-    if (hb) c.speed -= c.speed * 2.4 * dt;
-    // заглохший мотор: машина докатывается
-    if (this.stalled) c.speed -= c.speed * Math.min(1, 1.5 * dt);
 
-    // трава тормозит
-    if (!this.isOnRoad(c.x, c.y)) {
-      const s = c.speed;
-      if (Math.abs(s) > 250) c.speed = s - Math.sign(s) * 560 * dt;
-      else c.speed = s - Math.sign(s) * Math.min(Math.abs(s), 150 * dt);
-      if (Math.abs(s) > 70 && Math.random() < 0.4) {
-        this.spawn(c.x - Math.cos(c.angle) * 16, c.y - Math.sin(c.angle) * 16, "smoke", "rgba(128,138,116,0.4)", 1, 50);
+    const physics = c.step(
+      {
+        throttle,
+        brake,
+        steering: dir,
+        handbrake: hb ? 1 : 0,
+      },
+      dt,
+      {
+        maxForwardSpeed: maxSpeed,
+        maxReverseSpeed: REV_MAX,
+        surfaceGrip: onRoad ? 1 : 0.56,
+        resistance: onRoad ? (this.stalled ? 1.7 : 1) : 3.4,
       }
-    }
-    c.speed = clamp(c.speed, -REV_MAX, maxSpeed);
+    );
 
-    // руль
-    const dir = (left ? -1 : 0) + (right ? 1 : 0);
-    const sp = Math.abs(c.speed);
-    let grip = Math.min(sp / 150, 1) * (1 - 0.42 * (sp / maxSpeed));
-    if (hb) grip *= 1.75;
-    c.angle += dir * 3.1 * grip * (c.speed < -1 ? -1 : 1) * dt;
-    c.steer += (dir - c.steer) * Math.min(1, 10 * dt);
+    if (!onRoad && physics.absoluteSpeed > 70 && Math.random() < 0.4) {
+      this.spawn(
+        c.x - Math.cos(c.angle) * 16,
+        c.y - Math.sin(c.angle) * 16,
+        "smoke",
+        "rgba(128,138,116,0.4)",
+        1,
+        50
+      );
+    }
 
     // следы юза
-    const skidding = (hb && sp > 140) || (dir !== 0 && sp > maxSpeed * 0.68);
+    const skidding =
+      (hb && physics.absoluteSpeed > 110) ||
+      (physics.slipping && physics.absoluteSpeed > 135);
     const hx = Math.cos(c.angle);
     const hy = Math.sin(c.angle);
     const px = -hy;
@@ -1450,10 +1443,6 @@ export class CityRideGame {
       this.prevWheelL = this.prevWheelR = null;
     }
 
-    // движение
-    c.x += hx * c.speed * dt;
-    c.y += hy * c.speed * dt;
-
     // выхлоп
     if (up && Math.random() < 0.55) {
       this.spawn(
@@ -1468,7 +1457,7 @@ export class CityRideGame {
 
     this.applyKnock(dt);
     this.collide(interactive);
-    return throttle;
+    return Math.abs(throttle);
   }
 
   private maybeEmitLeaderboard(): void {
@@ -1640,8 +1629,8 @@ export class CityRideGame {
       {
         x: this.car.x,
         y: this.car.y,
-        vx: Math.cos(this.car.angle) * this.car.speed + this.knock.x,
-        vy: Math.sin(this.car.angle) * this.car.speed + this.knock.y,
+        vx: this.car.velocityX + this.knock.x,
+        vy: this.car.velocityY + this.knock.y,
         fixed: this.refueling,
         bot: null,
       },
@@ -1743,7 +1732,7 @@ export class CityRideGame {
     } else {
       this.knock.x += kx;
       this.knock.y += ky;
-      this.car.speed *= 0.45;
+      this.car.scaleVelocity(0.45);
       this.cam.shake = Math.min(18, this.cam.shake + Math.hypot(kx, ky) / 42);
     }
   }
@@ -1757,7 +1746,7 @@ export class CityRideGame {
     } else {
       this.knock.x += kx;
       this.knock.y += ky;
-      this.car.speed *= 0.6;
+      this.car.scaleVelocity(0.6);
       this.cam.shake = Math.min(14, this.cam.shake + 4);
     }
   }
@@ -1936,7 +1925,7 @@ export class CityRideGame {
 
   private updateFuel(dt: number): void {
     const c = this.car;
-    const sp = Math.abs(c.speed);
+    const sp = c.absoluteSpeed;
     const speed01 = sp / this.getPlayerMaxSpeed();
     const up = this.keys.has("up");
     // доли считаются от «расхода на полном газу»: холостой ход, газ и ручник
@@ -2018,7 +2007,7 @@ export class CityRideGame {
           room <= target + 0.0005 ? "full" : allowance <= target + 0.0005 ? "limit" : "money";
         this.refueling = true;
         this.takeStation(at, this.canisters, true);
-        this.cam.shake = Math.min(12, this.cam.shake + Math.abs(c.speed) / 90);
+        this.cam.shake = Math.min(12, this.cam.shake + c.absoluteSpeed / 90);
         for (let i = 0; i < 8; i++) {
           this.spawn(c.x, c.y, "smoke", "rgba(150,160,178,0.35)", 0.7, 40);
         }
@@ -2223,7 +2212,7 @@ export class CityRideGame {
         const d = Math.sqrt(d2);
         c.x += (dx / d) * (rr - d);
         c.y += (dy / d) * (rr - d);
-        c.speed *= 0.72;
+        c.scaleVelocity(0.72);
         if (this.leafCd <= 0) {
           this.leafCd = 0.4;
           for (let i = 0; i < 6; i++) this.spawn(t.x, t.y - 10, "leaf", "#4d8a5c", 0.7, 90);
@@ -2250,9 +2239,9 @@ export class CityRideGame {
     }
 
     if (hit) {
-      const sp = Math.abs(c.speed);
+      const sp = c.absoluteSpeed;
       if (sp > 70) {
-        c.speed *= 0.42;
+        c.scaleVelocity(0.42);
         this.cam.shake = Math.min(14, 5 + sp * 0.012);
         for (let i = 0; i < 9; i++) {
           this.spawn(c.x + Math.cos(c.angle) * 14, c.y + Math.sin(c.angle) * 14, "spark", i % 2 ? "#ffd27a" : "#c9cdd6", 0.35, 210);
@@ -2262,7 +2251,7 @@ export class CityRideGame {
           sfx.thud();
         }
       } else {
-        c.speed *= 0.78;
+        c.scaleVelocity(0.78);
       }
     }
   }
@@ -2370,9 +2359,9 @@ export class CityRideGame {
       ty = WORLD / 2 + Math.sin(t * 0.77) * WORLD * 0.24;
       tz = 0.66;
     } else {
-      const sp = Math.abs(this.car.speed);
-      tx = this.car.x + Math.cos(this.car.angle) * sp * 0.33;
-      ty = this.car.y + Math.sin(this.car.angle) * sp * 0.33;
+      const sp = this.car.absoluteSpeed;
+      tx = this.car.x + this.car.velocityX * 0.33;
+      ty = this.car.y + this.car.velocityY * 0.33;
       tz = 1.04 - (sp / this.getPlayerMaxSpeed()) * 0.22;
     }
     const kp = 1 - Math.exp(-6 * dt);
