@@ -5,6 +5,7 @@ import type { Client } from "./game/clients";
 import { CityRideGame } from "./game/engine";
 import type { HudData, LeaderboardEntry } from "./game/engine";
 import { sfx } from "./game/audio";
+import { music } from "./game/music";
 import { CONFIG } from "./game/config";
 import {
   BOOSTER_MENU_ITEMS,
@@ -61,6 +62,22 @@ const SpeakerIcon = ({ muted }: { muted: boolean }) => (
       <path d="M16 9l5 6M21 9l-5 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     ) : (
       <path d="M16 9a4 4 0 010 6M18.5 6.5a8 8 0 010 11" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    )}
+  </svg>
+);
+const MusicIcon = ({ off }: { off: boolean }) => (
+  <svg viewBox="0 0 24 24" fill="none" className="w-5 h-5">
+    <path
+      d="M9 18V6l10-2v12"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <circle cx="6.5" cy="18" r="2.5" stroke="currentColor" strokeWidth="2" />
+    <circle cx="16.5" cy="16" r="2.5" stroke="currentColor" strokeWidth="2" />
+    {off && (
+      <path d="M4 4L20 20" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     )}
   </svg>
 );
@@ -158,6 +175,7 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [modal, setModal] = useState<{ client: Client; index: number } | null>(null);
   const [muted, setMuted] = useState(false);
+  const [musicOn, setMusicOn] = useState(music.isEnabled);
   const [win, setWin] = useState<{ time: number; top: number } | null>(null);
   const [gameover, setGameover] = useState<{ time: number; found: number } | null>(null);
   const [toast, setToast] = useState<{ id: number; msg: string } | null>(null);
@@ -404,9 +422,33 @@ export default function App() {
     return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
   }, [boostersOpen]);
 
+  // Браузер открывает звук только после жеста игрока: на стартовом экране ловим
+  // первое касание или клавишу и включаем музыку, не дожидаясь начала заезда.
+  useEffect(() => {
+    if (phase !== "menu" || !musicOn) return;
+
+    const startMusic = (event: Event) => {
+      // Жест по самой кнопке музыки (или клавиша B) — это её выключение:
+      // качать трек незачем, переключатель отработает сам.
+      if (event instanceof KeyboardEvent && event.code === "KeyB") return;
+      const target = event.target as Element | null;
+      if (target?.closest?.("[data-music-toggle]")) return;
+      music.play();
+      window.removeEventListener("pointerdown", startMusic);
+      window.removeEventListener("keydown", startMusic);
+    };
+    window.addEventListener("pointerdown", startMusic);
+    window.addEventListener("keydown", startMusic);
+    return () => {
+      window.removeEventListener("pointerdown", startMusic);
+      window.removeEventListener("keydown", startMusic);
+    };
+  }, [phase, musicOn]);
+
   const start = () => {
     sfx.init();
     sfx.tick();
+    music.play();
     const game = gameRef.current;
     const network = networkRef.current;
     const online = connectionStatus === "online" && !!network?.connected;
@@ -557,6 +599,13 @@ export default function App() {
     });
   };
 
+  const toggleMusic = () => {
+    setMusicOn((on) => {
+      music.setEnabled(!on);
+      return !on;
+    });
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.code === "Enter") {
@@ -588,6 +637,7 @@ export default function App() {
         activateInactiveStationBooster(INACTIVE_STATION_BOOSTERS[0]);
       }
       if (e.code === "KeyV") toggleMute();
+      if (e.code === "KeyB") toggleMusic();
       if (e.code === "Escape") {
         if (boostersOpen) setBoostersOpen(false);
         else if (mapOpen) setMapOpen(false);
@@ -928,7 +978,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* правый верх: карта и звук */}
+          {/* правый верх: карта, музыка и звук */}
           <div className="absolute top-4 right-4 z-10 pointer-events-auto flex items-center gap-2">
               <button
                 onClick={() => setMapOpen(true)}
@@ -941,9 +991,20 @@ export default function App() {
                 <span className="kbd hidden lg:inline">M</span>
               </button>
               <button
+                onClick={toggleMusic}
+                data-music-toggle
+                className="w-9 h-9 rounded-md bg-night-900/85 border border-night-600 flex items-center justify-center text-slate-400 hover:text-amber-glow hover:border-night-600 transition-colors"
+                aria-label={musicOn ? "Выключить музыку" : "Включить музыку"}
+                aria-pressed={musicOn}
+                title="Музыка (B)"
+              >
+                <MusicIcon off={!musicOn} />
+              </button>
+              <button
                 onClick={toggleMute}
                 className="w-9 h-9 rounded-md bg-night-900/85 border border-night-600 flex items-center justify-center text-slate-400 hover:text-amber-glow hover:border-night-600 transition-colors"
                 aria-label="Звук"
+                title="Звук (V)"
               >
                 <SpeakerIcon muted={muted} />
               </button>
@@ -1283,9 +1344,20 @@ export default function App() {
                   медиа-агентство «Щит и Пика»
                 </span>
                 <button
+                  onClick={toggleMusic}
+                  data-music-toggle
+                  className="w-10 h-10 rounded-md bg-night-900/85 border border-night-600 flex items-center justify-center text-slate-400 hover:text-amber-glow transition-colors"
+                  aria-label={musicOn ? "Выключить музыку" : "Включить музыку"}
+                  aria-pressed={musicOn}
+                  title="Музыка (B)"
+                >
+                  <MusicIcon off={!musicOn} />
+                </button>
+                <button
                   onClick={toggleMute}
                   className="w-10 h-10 rounded-md bg-night-900/85 border border-night-600 flex items-center justify-center text-slate-400 hover:text-amber-glow transition-colors"
                   aria-label="Звук"
+                  title="Звук (V)"
                 >
                   <SpeakerIcon muted={muted} />
                 </button>
@@ -1338,6 +1410,9 @@ export default function App() {
                   </div>
                   <div className="flex items-center gap-3">
                     <span className="kbd">V</span> звук вкл/выкл
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="kbd">B</span> музыка вкл/выкл
                   </div>
                 </div>
                 <div className="mt-4 pt-3 border-t border-night-700 flex items-start gap-2.5 text-xs text-slate-400 leading-relaxed">
