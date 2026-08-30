@@ -7,6 +7,7 @@ import type { Bot } from "./bots";
 import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
 import { CONFIG } from "./config";
 import type {
+  CollisionEvent,
   EntitySnapshot,
   InteractionResult,
   OnlineGameTransport,
@@ -458,6 +459,34 @@ export class CityRideGame {
     }
   }
 
+  /**
+   * Столкновение, посчитанное сервером. Сама физика (отскок, стан, выпавшие
+   * канистры) приезжает следом снапшотом — здесь только то, что снапшот
+   * передать не может: искры, тряска камеры, звук удара и сообщение игроку.
+   */
+  applyCollision(event: CollisionEvent): void {
+    const mine =
+      !!this.onlinePlayerId &&
+      ((event.rammerIsPlayer && event.rammerId === this.onlinePlayerId) ||
+        (event.victimIsPlayer && event.victimId === this.onlinePlayerId));
+
+    this.crashEffects(event.x, event.y, event.force, mine);
+    if (!mine) return;
+
+    const victimIsMe = event.victimIsPlayer && event.victimId === this.onlinePlayerId;
+    // моя машина участвовала — тряхнём камеру так же, как в офлайне
+    const impulse = victimIsMe ? event.force : event.force * 0.16;
+    this.cam.shake = Math.min(18, this.cam.shake + impulse / 42);
+
+    if (victimIsMe && event.spilled > 0) {
+      // сервер уже уменьшил счётчик; сюда приходит только сообщение игроку
+      for (let i = 0; i < event.spilled * 8; i++) {
+        this.spawn(event.x, event.y, "spark", i % 2 ? CANISTER_ACCENT : "#d8f2ff", 0.5, 110);
+      }
+      this.cb.onCanisterLost(event.spilled, Math.max(0, this.canisters - event.spilled));
+    }
+  }
+
   applyWorldObjects(objects: WorldObjects): void {
     this.city.stations = objects.stations;
     this.city.billboards = objects.billboards;
@@ -643,6 +672,10 @@ export class CityRideGame {
     const fuelAdded = Math.max(0, player.fuel - oldFuel);
 
     this.playerName = player.name;
+    // Отскок после тарана считает сервер. Кладём его в локальное предсказание,
+    // чтобы машину уносило кадр в кадр, а не догоняло рывками через reconcile.
+    this.knock.x = player.kx ?? 0;
+    this.knock.y = player.ky ?? 0;
     this.applyServerPosition(player, mode);
     this.fuel = player.fuel;
     this.fuelMax = player.tankVolume;
@@ -758,9 +791,9 @@ export class CityRideGame {
       at: null,
       think: 0,
       taken: entity.taken ?? entity.canisters ?? 0,
-      kx: 0,
-      ky: 0,
-      stun: 0,
+      kx: entity.kx ?? 0,
+      ky: entity.ky ?? 0,
+      stun: entity.stun ?? 0,
       style: entity.style ?? 0.9,
       lane: entity.lane ?? 0,
       wob: entity.wobble ?? 0,

@@ -284,6 +284,9 @@ export default function App() {
       onEntities: (entities) => {
         gameRef.current?.applyEntities(entities);
       },
+      onCollisions: (collisions) => {
+        for (const collision of collisions) gameRef.current?.applyCollision(collision);
+      },
       onObjects: (objects) => {
         gameRef.current?.applyWorldObjects(objects);
       },

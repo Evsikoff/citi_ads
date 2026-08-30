@@ -26,6 +26,9 @@ export interface PublicPlayerState {
   filledLiters: number;
   status: "active" | "lost" | string;
   lastInputSeq: number;
+  /** Накопленный сервером отскок после тарана, пикс/с. */
+  kx?: number;
+  ky?: number;
 }
 
 export interface RemoteEntityState {
@@ -44,6 +47,9 @@ export interface RemoteEntityState {
   style?: number;
   lane?: number;
   wobble?: number;
+  kx?: number;
+  ky?: number;
+  stun?: number;
 }
 
 export interface EntitySnapshot {
@@ -52,6 +58,25 @@ export interface EntitySnapshot {
   worldRevision: number;
   players: PublicPlayerState[];
   bots: RemoteEntityState[];
+}
+
+/**
+ * Столкновение двух машин, посчитанное сервером. Клиент по нему рисует искры,
+ * трясёт камеру, даёт звук удара и сообщает о выбитых канистрах.
+ */
+export interface CollisionEvent {
+  /** Точка касания кузовов в мировых координатах. */
+  x: number;
+  y: number;
+  /** Сила удара — та же величина, что ушла в отскок. */
+  force: number;
+  /** Кто протаранил и кого: id игрока или бота. */
+  rammerId: string;
+  victimId: string;
+  rammerIsPlayer: boolean;
+  victimIsPlayer: boolean;
+  /** Сколько канистр выбило из протаранённой машины. */
+  spilled: number;
 }
 
 export interface ServerLeaderboardEntry {
@@ -139,6 +164,7 @@ export interface MultiplayerListeners {
     leaderboard: ServerLeaderboardEntry[]
   ): void;
   onEntities?(entities: EntitySnapshot): void;
+  onCollisions?(collisions: CollisionEvent[]): void;
   onObjects?(objects: WorldObjects): void;
   onMapUpdate?(map: ServerCity, reason: string, fuelBonus: number): void;
   onLeaderboard?(rows: ServerLeaderboardEntry[]): void;
@@ -378,6 +404,13 @@ export class MultiplayerClient implements OnlineGameTransport {
         const payload = message.payload as EntitySnapshot;
         this.worldRevision = payload.worldRevision;
         this.listeners.onEntities?.(payload);
+        return;
+      }
+      case "world:collisions": {
+        const payload = message.payload as { tick: number; collisions: CollisionEvent[] };
+        if (Array.isArray(payload.collisions) && payload.collisions.length > 0) {
+          this.listeners.onCollisions?.(payload.collisions);
+        }
         return;
       }
       case "world:objects": {
