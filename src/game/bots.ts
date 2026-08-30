@@ -59,6 +59,7 @@ export interface Bot {
   gotCanister: boolean; // пункт «взять канистру» выполнен
   refuelled: boolean; // пункт «заправиться» выполнен
   wait: number; // стоим под колонкой, с
+  refuelTotal: number; // полный таймаут текущей заправки, с
   at: Station | null; // под какой колонкой стоим
   think: number; // до пересчёта цели, с
   taken: number; // сколько канистр забрал за заезд
@@ -328,6 +329,7 @@ export function createBots(city: City, count: number, start: { x: number; y: num
       gotCanister: false,
       refuelled: false,
       wait: 0,
+      refuelTotal: 0,
       at: null,
       think: 0,
       taken: 0,
@@ -368,7 +370,10 @@ export function stepBot(
     // стоим под колонкой
     b.wait -= dt;
     b.speed *= Math.max(0, 1 - 6 * dt);
-    if (b.wait <= 0) b.at = null;
+    if (b.wait <= 0) {
+      b.at = null;
+      b.refuelTotal = 0;
+    }
     return step;
   }
 
@@ -417,6 +422,7 @@ export function stepBot(
     const s = g.st;
     if (s.state === "active" && b.x > s.x - 6 && b.x < s.x + s.w + 6 && b.y > s.y - 6 && b.y < s.y + s.h + 6) {
       b.wait = Math.max(0, refuelSeconds);
+      b.refuelTotal = b.wait;
       b.at = s;
       b.refuelled = true;
       b.goal = null;

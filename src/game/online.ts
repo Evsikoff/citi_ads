@@ -5,6 +5,43 @@ export const GAME_SERVER_URL =
 
 export type ConnectionStatus = "connecting" | "online" | "offline";
 
+const SERVER_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  accepted: "Действие выполнено.",
+  "room-full": "Комната заполнена.",
+  "player-not-found": "Игрок не найден.",
+  "player-inactive": "Игрок сейчас не участвует в заезде.",
+  "player-already-active": "Игрок уже участвует в заезде.",
+  "already-lost": "Заезд этого игрока уже завершён.",
+  "object-not-found": "Игровой объект не найден.",
+  "unsupported-object": "Это действие не поддерживается.",
+  "canister-taken": "Эту канистру уже подобрали.",
+  "too-far": "Нужно подъехать ближе.",
+  "station-locked": "Эта заправка сейчас закрыта.",
+  "tank-full": "Бак уже полон.",
+  "not-enough-money": "Недостаточно денег.",
+  "nothing-to-sell": "Нет топлива для продажи.",
+  "invalid-liters": "Указан некорректный объём топлива.",
+  "tank-capacity-exceeded": "Указанный объём не помещается в бак.",
+  "station-limit-exceeded": "Превышен лимит отпуска этой колонки.",
+  "billboard-cooldown": "Этот рекламный щит ещё недоступен.",
+  "all-stations-active": "Все заправки уже работают.",
+  "unknown-booster": "Игровой эффект этого улучшения не настроен.",
+  "stale-world": "Карта обновилась — повторите действие.",
+  "stale-sequence": "Получена устаревшая команда управления.",
+  "movement-too-fast": "Сервер отклонил слишком резкое перемещение.",
+  "binary-not-supported": "Поддерживаются только текстовые JSON-сообщения.",
+  "invalid-message": "Сервер получил некорректное сообщение.",
+  "already-joined": "Это подключение уже участвует в заезде.",
+  "join-failed": "Не удалось присоединиться к заезду.",
+  "join-required": "Сначала нужно присоединиться к заезду.",
+  "interaction-failed": "Не удалось выполнить игровое действие.",
+});
+
+export function serverMessage(code: string, supplied?: string): string {
+  if (supplied && /[А-Яа-яЁё]/.test(supplied)) return supplied;
+  return SERVER_MESSAGES[code] ?? `Сервер отклонил запрос (${code}).`;
+}
+
 export interface ServerHello {
   protocolVersion: number;
   tickRate: number;
@@ -35,6 +72,9 @@ export interface PublicPlayerState {
   /** Литры и рубли текущей сессии заправки. */
   refuelLiters?: number;
   refuelSpent?: number;
+  /** Полный таймаут и оставшееся время текущей заправки, в секундах. */
+  refuelDuration?: number;
+  refuelRemaining?: number;
   /** Множители от бустеров — их считает сервер. */
   speedMultiplier?: number;
   fuelConsumptionMultiplier?: number;
@@ -53,6 +93,10 @@ export interface RemoteEntityState {
   canisters?: number;
   taken?: number;
   wait?: number;
+  refueling?: boolean;
+  refuelStationId?: string | null;
+  refuelDuration?: number;
+  refuelRemaining?: number;
   style?: number;
   lane?: number;
   wobble?: number;
@@ -131,6 +175,7 @@ export interface InteractionResult {
   requestId: string;
   ok: boolean;
   code: string;
+  message?: string;
   player: PublicPlayerState;
   details?: Record<string, unknown>;
 }

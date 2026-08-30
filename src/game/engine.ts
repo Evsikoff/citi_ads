@@ -808,6 +808,8 @@ export class CityRideGame {
       : null;
     this.sessionLiters = player.refuelLiters ?? 0;
     this.sessionSpent = player.refuelSpent ?? 0;
+    this.sessionDuration = player.refuelDuration ?? 0;
+    this.sessionElapsed = Math.max(0, this.sessionDuration - (player.refuelRemaining ?? 0));
     if (typeof player.speedMultiplier === "number") this.speedMultiplier = player.speedMultiplier;
     if (typeof player.fuelConsumptionMultiplier === "number") {
       this.fuelConsumptionMultiplier = player.fuelConsumptionMultiplier;
@@ -903,8 +905,12 @@ export class CityRideGame {
       goal: null,
       gotCanister: false,
       refuelled: false,
-      wait: entity.wait ?? 0,
-      at: null,
+      wait: entity.refuelRemaining ?? entity.wait ?? 0,
+      refuelTotal: entity.refuelDuration ?? entity.wait ?? 0,
+      at:
+        entity.refueling && entity.refuelStationId
+          ? this.city.stations.find((station) => station.id === entity.refuelStationId) ?? null
+          : null,
       think: 0,
       taken: entity.taken ?? entity.canisters ?? 0,
       kx: entity.kx ?? 0,
@@ -3031,18 +3037,41 @@ export class CityRideGame {
    */
   private drawRefuelInfo(vis: Rect): void {
     if (this.refueling && this.refuelStation) {
-      this.drawInfoPlate(this.car.x, this.car.y - 46, this.unlockLeft(this.refuelStation), this.canisters);
+      this.drawInfoPlate(
+        this.car.x,
+        this.car.y - 46,
+        this.online?.connected ? Math.max(0, this.sessionDuration - this.sessionElapsed) : this.unlockLeft(this.refuelStation),
+        this.sessionDuration,
+        this.canisters
+      );
     }
     for (const b of this.bots) {
       if (b.wait <= 0 || !b.at) continue;
       if (!inView({ x: b.x - 80, y: b.y - 80, w: 160, h: 160 }, vis)) continue;
-      this.drawInfoPlate(b.x, b.y - 46, this.unlockLeft(b.at), b.taken);
+      this.drawInfoPlate(
+        b.x,
+        b.y - 46,
+        this.online?.connected ? b.wait : this.unlockLeft(b.at),
+        b.refuelTotal,
+        b.taken
+      );
     }
   }
 
-  private drawInfoPlate(x: number, y: number, left: number | null, canisters: number): void {
+  private drawInfoPlate(
+    x: number,
+    y: number,
+    left: number | null,
+    total: number,
+    canisters: number
+  ): void {
     const { ctx } = this;
-    const timeText = left === null ? "—" : `${left.toFixed(1)} с`;
+    const timeText =
+      left === null
+        ? "—"
+        : total > 0
+          ? `${left.toFixed(1)} из ${total.toFixed(1)} с`
+          : `${left.toFixed(1)} с`;
     const canText = String(canisters);
     ctx.save();
     ctx.font = '700 12px Rubik, system-ui, sans-serif';

@@ -23,6 +23,7 @@ import boostersIcon from "./images/boosters/boosters.png";
 import {
   GAME_SERVER_URL,
   MultiplayerClient,
+  serverMessage,
 } from "./game/online";
 import type { ConnectionStatus } from "./game/online";
 
@@ -308,7 +309,7 @@ export default function App() {
       },
       onInteractionResult: (result) => {
         gameRef.current?.applyInteractionResult(result);
-        if (!result.ok) showToast(`Действие отклонено сервером: ${result.code}`);
+        if (!result.ok) showToast(serverMessage(result.code, result.message));
       },
       onGameEventResult: (result) => {
         gameRef.current?.applyInteractionResult(result);
@@ -325,7 +326,7 @@ export default function App() {
           if (result.details?.revived) setGameover(null);
           return;
         }
-        if (!result.ok) showToast(`Событие отклонено сервером: ${result.code}`);
+        if (!result.ok) showToast(serverMessage(result.code, result.message));
       },
       onPlayerRespawned: (player) => {
         gameRef.current?.applyRespawn(player);
@@ -334,7 +335,7 @@ export default function App() {
       onPlayerJoined: (player) => showToast(`${player.name} подключился к заезду`),
       onPlayerLeft: () => showToast("Игрок покинул заезд"),
       onError: (error) => {
-        if (networkStatusRef.current === "online") showToast(`Сервер: ${error.message}`);
+        if (networkStatusRef.current === "online") showToast(serverMessage(error.code, error.message));
       },
     });
     networkRef.current = network;
