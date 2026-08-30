@@ -6,6 +6,7 @@ interface RefuelingVoice {
 
 const REFUELING_VOLUME = 0.6;
 const REFUELING_FADE_TIME = 0.12;
+const GASOLINE_SALE_VOLUME = 0.7;
 
 /** WebAudio-эффекты игры: синтезатор и зацикленные записи заправки. */
 class Sfx {
@@ -27,6 +28,9 @@ class Sfx {
     new URL("../sound/effects/refueling/Refueling1.mp3", import.meta.url).href,
     new URL("../sound/effects/refueling/Refueling2.mp3", import.meta.url).href,
   ];
+  private saleBuffer: AudioBuffer | null = null;
+  private saleLoad: Promise<void> | null = null;
+  private readonly saleFile = new URL("../sound/effects/gasoline_sales.mp3", import.meta.url).href;
 
   init(): void {
     try {
@@ -41,6 +45,7 @@ class Sfx {
       }
       if (this.ac.state === "suspended") void this.ac.resume();
       this.loadRefuelingBuffers();
+      void this.loadSaleBuffer();
     } catch {
       this.ac = null;
     }
@@ -285,6 +290,63 @@ class Sfx {
     } catch {
       voice.source.disconnect();
       voice.gain.disconnect();
+    }
+  }
+
+  /** игрок слил бензин на базе — запись кассы приёмщика */
+  gasolineSale(): void {
+    if (!this.ac) return;
+    if (this.saleBuffer) {
+      this.playSaleBuffer();
+      return;
+    }
+    // Первый слив может прийтись на ещё не загруженную запись: доигрываем её,
+    // как только декодирование закончится.
+    const ac = this.ac;
+    void this.loadSaleBuffer().then(() => {
+      if (this.ac === ac) this.playSaleBuffer();
+    });
+  }
+
+  private loadSaleBuffer(): Promise<void> {
+    const ac = this.ac;
+    if (!ac || this.saleBuffer) return Promise.resolve();
+    if (this.saleLoad) return this.saleLoad;
+
+    this.saleLoad = (async () => {
+      try {
+        const response = await fetch(this.saleFile);
+        if (!response.ok) return;
+        const buffer = await ac.decodeAudioData(await response.arrayBuffer());
+        if (this.ac === ac) this.saleBuffer = buffer;
+      } catch {
+        /* тишина */
+      }
+    })().finally(() => {
+      this.saleLoad = null;
+    });
+
+    return this.saleLoad;
+  }
+
+  private playSaleBuffer(): void {
+    const ac = this.ac;
+    const master = this.master;
+    if (!ac || !master || !this.saleBuffer) return;
+    try {
+      const source = ac.createBufferSource();
+      source.buffer = this.saleBuffer;
+      const gain = ac.createGain();
+      gain.gain.value = GASOLINE_SALE_VOLUME;
+      source.connect(gain);
+      gain.connect(master);
+      source.onended = () => {
+        source.disconnect();
+        gain.disconnect();
+      };
+      source.start();
+    } catch {
+      /* тишина */
     }
   }
 
