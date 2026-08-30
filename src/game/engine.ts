@@ -109,6 +109,8 @@ type PositionMode = "snap" | "reconcile" | "stats";
 interface RemoteEntity {
   bot: Bot;
   buffer: RemoteSample[];
+  refuelStationId?: string | null;
+  refueling?: boolean;
 }
 
 const REV_MAX = 215;
@@ -500,6 +502,9 @@ export class CityRideGame {
         remote.bot.angle = entity.angle;
         remote.bot.speed = entity.speed;
       }
+      // Сохраняем информацию о заправке соперника
+      remote.refueling = entity.refueling;
+      remote.refuelStationId = entity.refuelStationId;
       next.set(entity.id, remote);
     }
     this.remoteEntities = next;
@@ -531,6 +536,26 @@ export class CityRideGame {
       entity.bot.y = at.y;
       entity.bot.angle = at.angle;
       entity.bot.speed = at.speed;
+    }
+    // Обновляем звук заправки для соперников
+    this.updateOpponentRefuelingSounds();
+  }
+
+  /** Обновляет звуки заправки для всех соперников на основе их расстояния до игрока */
+  private updateOpponentRefuelingSounds(): void {
+    for (const entity of this.remoteEntities.values()) {
+      if (!entity.refueling || !entity.refuelStationId) continue;
+      
+      const station = this.city.stations.find(s => s.id === entity.refuelStationId);
+      if (!station) continue;
+      
+      // Расстояние от игрока до АЗС, где заправляется соперник
+      const distance = Math.hypot(this.car.x - (station.x + station.w / 2), this.car.y - (station.y + station.h / 2));
+      
+      // Проверяем, воспроизводится ли уже звук для этой станции
+      // Если нет — запускаем, если да — обновляем громкость
+      sfx.startRefueling(false, distance);
+      sfx.updateRefuelingVolume(distance);
     }
   }
 
@@ -876,7 +901,12 @@ export class CityRideGame {
     if (typeof player.fuelConsumptionMultiplier === "number") {
       this.fuelConsumptionMultiplier = player.fuelConsumptionMultiplier;
     }
-    if (wasRefuelling && !this.refueling) this.refuelSndCd = 0;
+    // Обработка начала/окончания заправки игрока в онлайн-режиме
+    if (!wasRefuelling && this.refueling && this.refuelStation) {
+      sfx.startRefueling(true);
+    } else if (wasRefuelling && !this.refueling) {
+      sfx.stopRefueling();
+    }
 
     if (player.canisters > oldCanisters) {
       this.cb.onCanister(player.canisters, CANISTER_L);
@@ -1996,6 +2026,8 @@ export class CityRideGame {
         for (let i = 0; i < 8; i++) {
           this.spawn(c.x, c.y, "smoke", "rgba(150,160,178,0.35)", 0.7, 40);
         }
+        // Запуск звука заправки для игрока
+        sfx.startRefueling(true);
       }
     }
 
@@ -2046,12 +2078,16 @@ export class CityRideGame {
       this.refueling = false;
       this.refuelStation = null;
       this.usedStation = completedStation;
+      // Остановка звука заправки
+      sfx.stopRefueling();
     } else if (this.refueling) {
       // За обычной ездой уйти нельзя: управление на время обслуживания
       // заблокировано. Ветка нужна для замены карты или внешнего телепорта.
       this.refueling = false;
       this.usedStation = this.refuelStation;
       this.refuelStation = null;
+      // Остановка звука заправки при прерывании
+      sfx.stopRefueling();
     } else if (this.usedStation) {
       if (at !== this.usedStation) this.usedStation = null;
     } else if (at?.state === "active") {

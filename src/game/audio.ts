@@ -9,6 +9,14 @@ class Sfx {
   private engineOn = false;
   muted = false;
   private wasMutedByBlur = false;
+  
+  // Звук заправки
+  private refuelSource: HTMLAudioElement | null = null;
+  private refuelGain: GainNode | null = null;
+  private refuelFiles = [
+    new URL("../sound/effects/refueling/Refueling1.mp3", import.meta.url).href,
+    new URL("../sound/effects/refueling/Refueling2.mp3", import.meta.url).href,
+  ];
 
   init(): void {
     try {
@@ -58,6 +66,82 @@ class Sfx {
     if (this.master && this.ac) {
       this.master.gain.setTargetAtTime(m ? 0 : 0.5, this.ac.currentTime, 0.05);
     }
+  }
+
+  /**
+   * Начать звук заправки.
+   * @param isPlayer - true если заправляется игрок, false если соперник
+   * @param distance - расстояние до АЗС в пикселях (используется только для соперника)
+   */
+  startRefueling(isPlayer: boolean, distance?: number): void {
+    this.stopRefueling();
+    if (!this.ac || !this.master) return;
+    
+    try {
+      const file = this.refuelFiles[Math.floor(Math.random() * this.refuelFiles.length)];
+      this.refuelSource = new Audio(file);
+      this.refuelSource.loop = true;
+      
+      this.refuelGain = this.ac.createGain();
+      this.refuelGain.connect(this.master);
+      
+      const sourceNode = this.ac.createMediaElementSource(this.refuelSource);
+      sourceNode.connect(this.refuelGain);
+      
+      // Для игрока громкость полная, для соперника зависит от расстояния
+      let targetGain = isPlayer ? 0.6 : this.calcDistanceGain(distance ?? 0);
+      this.refuelGain.gain.setValueAtTime(0, this.ac.currentTime);
+      this.refuelGain.gain.linearRampToValueAtTime(targetGain, this.ac.currentTime + 0.3);
+      
+      void this.refuelSource.play().catch(() => {
+        // Игнорируем ошибки автовоспроизведения
+      });
+    } catch {
+      this.refuelSource = null;
+      this.refuelGain = null;
+    }
+  }
+
+  /**
+   * Обновить громкость звука заправки (для соперника при изменении расстояния).
+   * @param distance - расстояние до АЗС в пикселях
+   */
+  updateRefuelingVolume(distance: number): void {
+    if (!this.refuelGain || !this.ac) return;
+    const targetGain = this.calcDistanceGain(distance);
+    const currentGain = this.refuelGain.gain.value;
+    // Плавное изменение громкости
+    if (Math.abs(currentGain - targetGain) > 0.01) {
+      this.refuelGain.gain.setTargetAtTime(targetGain, this.ac.currentTime, 0.1);
+    }
+  }
+
+  /** Завершить звук заправки */
+  stopRefueling(): void {
+    if (this.refuelSource) {
+      this.refuelSource.pause();
+      this.refuelSource.currentTime = 0;
+      this.refuelSource = null;
+    }
+    if (this.refuelGain && this.ac) {
+      // Плавное затухание
+      this.refuelGain.gain.setTargetAtTime(0, this.ac.currentTime, 0.1);
+      setTimeout(() => {
+        if (this.refuelGain) {
+          this.refuelGain.disconnect();
+          this.refuelGain = null;
+        }
+      }, 200);
+    }
+  }
+
+  /** Рассчитать громкость по расстоянию: 1 на дистанции 0, 0 на 800px и дальше */
+  private calcDistanceGain(distance: number): number {
+    const maxDist = 800;
+    if (distance >= maxDist) return 0;
+    const gain = 1 - distance / maxDist;
+    // Нелинейное затухание для более естественного звучания
+    return Math.pow(gain, 1.5) * 0.6;
   }
 
   /** завести мотор */
