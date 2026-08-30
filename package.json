@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "netcheck": "node --experimental-strip-types --no-warnings src/game/netclock.check.ts",
+    "reconcheck": "node --experimental-strip-types --no-warnings src/game/reconcile.check.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.1.0",
