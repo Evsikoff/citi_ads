@@ -8,6 +8,7 @@ class Sfx {
   private engFilter: BiquadFilterNode | null = null;
   private engineOn = false;
   muted = false;
+  private wasMutedByBlur = false;
 
   init(): void {
     try {
@@ -23,6 +24,32 @@ class Sfx {
       if (this.ac.state === "suspended") void this.ac.resume();
     } catch {
       this.ac = null;
+    }
+
+    // Слушаем потерю/восстановление фокуса вкладки
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        this.handleBlur();
+      } else {
+        this.handleFocus();
+      }
+    });
+
+    window.addEventListener("blur", () => this.handleBlur());
+    window.addEventListener("focus", () => this.handleFocus());
+  }
+
+  private handleBlur(): void {
+    if (!this.muted && this.ac && this.master) {
+      this.wasMutedByBlur = true;
+      this.master.gain.setTargetAtTime(0, this.ac.currentTime, 0.05);
+    }
+  }
+
+  private handleFocus(): void {
+    if (this.wasMutedByBlur && !this.muted && this.ac && this.master) {
+      this.wasMutedByBlur = false;
+      this.master.gain.setTargetAtTime(0.5, this.ac.currentTime, 0.05);
     }
   }
 
