@@ -287,6 +287,9 @@ export default function App() {
       onCollisions: (collisions) => {
         for (const collision of collisions) gameRef.current?.applyCollision(collision);
       },
+      onRefuel: (event) => {
+        gameRef.current?.applyRefuelEvent(event);
+      },
       onObjects: (objects) => {
         gameRef.current?.applyWorldObjects(objects);
       },
@@ -309,10 +312,24 @@ export default function App() {
       },
       onGameEventResult: (result) => {
         gameRef.current?.applyInteractionResult(result);
+        if (result.event === "booster-applied") {
+          if (!result.ok) {
+            showToast(
+              result.code === "not-enough-money"
+                ? "Не хватило денег на улучшение"
+                : "Для этого улучшения пока не настроен игровой эффект"
+            );
+            return;
+          }
+          setBoosterBalance(gameRef.current?.getMoney() ?? 0);
+          if (result.details?.revived) setGameover(null);
+          return;
+        }
         if (!result.ok) showToast(`Событие отклонено сервером: ${result.code}`);
       },
       onPlayerRespawned: (player) => {
         gameRef.current?.applyRespawn(player);
+        setGameover(null);
       },
       onPlayerJoined: (player) => showToast(`${player.name} подключился к заезду`),
       onPlayerLeft: () => showToast("Игрок покинул заезд"),
@@ -390,9 +407,13 @@ export default function App() {
     const balance = game.getMoney();
     if (!isBoosterAvailable(booster, boosterPurchases, balance, CONFIG.startMoney)) return;
 
+    const cost =
+      booster.sales_method === "In-game currency"
+        ? calculateBoosterCost(booster, CONFIG.startMoney)
+        : 0;
     const completed =
       booster.sales_method === "In-game currency"
-        ? game.trySpendMoney(calculateBoosterCost(booster, CONFIG.startMoney))
+        ? game.trySpendMoney(cost)
         : executeExternalBoosterSale(booster);
 
     if (!completed) {
@@ -400,7 +421,7 @@ export default function App() {
       return;
     }
 
-    const effect = game.applyBooster(booster.system_name);
+    const effect = game.applyBooster(booster.system_name, cost);
     if (!effect.applied) {
       showToast("Для этого улучшения пока не настроен игровой эффект");
       return;

@@ -29,6 +29,15 @@ export interface PublicPlayerState {
   /** Накопленный сервером отскок после тарана, пикс/с. */
   kx?: number;
   ky?: number;
+  /** Идёт заправка: машина стоит под колонкой. */
+  refueling?: boolean;
+  refuelStationId?: string | null;
+  /** Литры и рубли текущей сессии заправки. */
+  refuelLiters?: number;
+  refuelSpent?: number;
+  /** Множители от бустеров — их считает сервер. */
+  speedMultiplier?: number;
+  fuelConsumptionMultiplier?: number;
 }
 
 export interface RemoteEntityState {
@@ -58,6 +67,16 @@ export interface EntitySnapshot {
   worldRevision: number;
   players: PublicPlayerState[];
   bots: RemoteEntityState[];
+}
+
+/** Заправка началась или закончилась — сервер ведёт её сам. */
+export interface RefuelEvent {
+  playerId: string;
+  stationId: string;
+  state: "started" | "stopped";
+  reason: "full" | "limit" | "money" | "left" | null;
+  liters: number;
+  spent: number;
 }
 
 /**
@@ -123,6 +142,7 @@ export interface GameEventResult extends InteractionResult {
     | "billboard-interacted"
     | "player-lost"
     | "player-respawn"
+    | "booster-applied"
     | string;
 }
 
@@ -152,6 +172,7 @@ export interface OnlineGameTransport {
   billboardInteracted(billboardId: string): string | null;
   playerLost(reason?: string): string | null;
   respawn(): string | null;
+  booster(systemName: string, cost?: number): string | null;
 }
 
 export interface MultiplayerListeners {
@@ -165,6 +186,7 @@ export interface MultiplayerListeners {
   ): void;
   onEntities?(entities: EntitySnapshot): void;
   onCollisions?(collisions: CollisionEvent[]): void;
+  onRefuel?(event: RefuelEvent): void;
   onObjects?(objects: WorldObjects): void;
   onMapUpdate?(map: ServerCity, reason: string, fuelBonus: number): void;
   onLeaderboard?(rows: ServerLeaderboardEntry[]): void;
@@ -336,6 +358,11 @@ export class MultiplayerClient implements OnlineGameTransport {
     return this.sendRequest("player:lost", reason ? { reason } : {});
   }
 
+  booster(systemName: string, cost = 0): string | null {
+    if (!this.gameReady) return null;
+    return this.sendRequest("player:booster", { systemName, cost });
+  }
+
   respawn(): string | null {
     if (!this.gameReady) return null;
     return this.sendRequest("player:respawn", {});
@@ -404,6 +431,10 @@ export class MultiplayerClient implements OnlineGameTransport {
         const payload = message.payload as EntitySnapshot;
         this.worldRevision = payload.worldRevision;
         this.listeners.onEntities?.(payload);
+        return;
+      }
+      case "player:refuel": {
+        this.listeners.onRefuel?.(message.payload as RefuelEvent);
         return;
       }
       case "world:collisions": {
