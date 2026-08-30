@@ -20,6 +20,36 @@ body,
   background: #0b101c;
   font-family: "Rubik", "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
+  /* прокрутка страницы и pull-to-refresh не должны доходить до документа */
+  overscroll-behavior: none;
+}
+
+body {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+}
+
+/* долгий тап не должен открывать системное меню и выделять текст */
+body {
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* поля ввода оставляем «живыми»: выделение, вставка, ползунки */
+input,
+textarea,
+select,
+[contenteditable="true"] {
+  -webkit-touch-callout: default;
+  -webkit-user-select: auto;
+  user-select: auto;
+}
+
+img {
+  -webkit-user-drag: none;
 }
 
 .font-display {
