@@ -8,6 +8,7 @@ import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
 import { CONFIG } from "./config";
 import { SnapshotTimeline, angleDelta, pushSample, sampleTimeline } from "./netclock";
 import type { RemoteSample } from "./netclock";
+import { PredictionSmoother } from "./reconcile";
 import type {
   CollisionEvent,
   EntitySnapshot,
@@ -107,8 +108,6 @@ const MM = 640;
 // Онлайн: своя машина считается локально каждый кадр (клиентское предсказание),
 // а серверное состояние вливается в картинку плавно — иначе машина дёргается на
 // каждом пакете.
-const RECONCILE_RATE = 7; // насколько быстро гасим расхождение с сервером, 1/с
-const RECONCILE_RATE_HARD = 20; // ускоренная сходимость сразу после тарана
 const RECONCILE_BOOST_S = 0.4; // сколько секунд держим ускоренную сходимость
 const RECONCILE_DEADZONE = 1.5; // расхождение меньше — машину не трогаем вовсе, px
 const RECONCILE_DEADZONE_SPEED = 8; // то же по скорости, пикс/с
@@ -280,9 +279,10 @@ export class CityRideGame {
   private onlineInputCd = 0;
   private onlineContacts = new Set<string>();
   private onlinePlayerStatus = "active";
-  // Расхождение предсказанной машины с последним состоянием сервера. Не
-  // применяется рывком: reconcilePrediction() размазывает его по кадрам.
-  private serverError = { x: 0, y: 0, angle: 0, speed: 0 };
+  // Расхождение предсказанной машины с состоянием сервера. Не применяется
+  // рывком: корректор подбирает его с ограниченной и плавно меняющейся
+  // скоростью, поэтому приход пакета не даёт толчка.
+  private smoother = new PredictionSmoother();
   private reconcileBoost = 0; // секунды ускоренной сходимости после тарана
   // Чужие машины и боты: отрисовка отдельно от того, что прислал сервер.
   private remoteEntities = new Map<string, RemoteEntity>();
@@ -382,7 +382,7 @@ export class CityRideGame {
     this.remoteEntities.clear();
     this.reconcileBoost = 0;
     this.timeline.reset();
-    this.resetServerError();
+    this.smoother.reset();
     if (!transport) {
       this.onlinePlayerId = null;
       this.onlinePlayerStatus = "active";
@@ -871,10 +871,11 @@ export class CityRideGame {
 
   /**
    * Кладёт серверное положение на машину игрока. Пока работает локальное
-   * предсказание, разницу не применяем сразу, а копим в serverError: её
-   * равномерно размажет по кадрам reconcilePrediction(), поэтому коррекция не
-   * видна как рывок. Мгновенно двигаем машину только там, где предсказывать
-   * нечего: вход в игру, респавн, гибель и совсем уж большое расхождение.
+   * предсказание, разницу не применяем сразу, а отдаём корректору: он подберёт
+   * её за несколько кадров с плавно меняющейся скоростью, поэтому коррекция
+   * читается как лёгкий снос, а не как толчок. Мгновенно двигаем машину только
+   * там, где предсказывать нечего: вход в игру, респавн, гибель и совсем уж
+   * большое расхождение.
    */
   private applyServerPosition(player: PublicPlayerState, mode: "reconcile" | "snap"): void {
     const c = this.car;
@@ -889,7 +890,7 @@ export class CityRideGame {
       c.y = player.y;
       c.angle = player.angle;
       c.speed = player.speed;
-      this.resetServerError();
+      this.smoother.reset();
       this.reconcileBoost = 0;
       return;
     }
@@ -910,7 +911,7 @@ export class CityRideGame {
       c.y = player.y;
       c.angle = player.angle;
       c.speed = player.speed;
-      this.resetServerError();
+      this.smoother.reset();
       this.reconcileBoost = 0;
       return;
     }
@@ -922,46 +923,24 @@ export class CityRideGame {
       Math.abs(dSpeed) < RECONCILE_DEADZONE_SPEED &&
       Math.abs(dAngle) < 0.02
     ) {
-      // предсказание совпало с сервером: любая правка здесь — это дрожь на
-      // ровном месте, в том числе у камеры, которая целится по скорости
-      this.resetServerError();
+      // Предсказание совпало с сервером: подбирать нечего. Цель обнуляем, но
+      // корректор не сбрасываем — он должен доехать до нуля сам, иначе резко
+      // оборванная поправка и будет тем самым рывком.
+      this.smoother.set(0, 0, 0, 0);
       return;
     }
 
-    this.serverError.x = ax - c.x;
-    this.serverError.y = ay - c.y;
-    this.serverError.angle = dAngle;
-    this.serverError.speed = dSpeed;
+    this.smoother.set(ax - c.x, ay - c.y, dAngle, dSpeed);
   }
 
-  /** гасит накопленное расхождение с сервером понемногу каждый кадр */
+  /** подбирает расхождение с сервером понемногу каждый кадр */
   private reconcilePrediction(dt: number): void {
     if (this.reconcileBoost > 0) this.reconcileBoost = Math.max(0, this.reconcileBoost - dt);
-    const e = this.serverError;
-    if (!e.x && !e.y && !e.angle && !e.speed) return;
-
-    const rate = this.reconcileBoost > 0 ? RECONCILE_RATE_HARD : RECONCILE_RATE;
-    const k = 1 - Math.exp(-rate * dt);
-    this.car.x += e.x * k;
-    this.car.y += e.y * k;
-    this.car.angle += e.angle * k;
-    this.car.speed += e.speed * k;
-    e.x -= e.x * k;
-    e.y -= e.y * k;
-    e.angle -= e.angle * k;
-    e.speed -= e.speed * k;
-
-    if (Math.abs(e.x) < 0.05) e.x = 0;
-    if (Math.abs(e.y) < 0.05) e.y = 0;
-    if (Math.abs(e.angle) < 0.0005) e.angle = 0;
-    if (Math.abs(e.speed) < 0.5) e.speed = 0;
-  }
-
-  private resetServerError(): void {
-    this.serverError.x = 0;
-    this.serverError.y = 0;
-    this.serverError.angle = 0;
-    this.serverError.speed = 0;
+    const fix = this.smoother.advance(dt, Math.abs(this.car.speed), this.reconcileBoost > 0);
+    this.car.x += fix.dx;
+    this.car.y += fix.dy;
+    this.car.angle += fix.dAngle;
+    this.car.speed += fix.dSpeed;
   }
 
   private toRenderBot(entity: RemoteEntityState): Bot {
