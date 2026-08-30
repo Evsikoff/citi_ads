@@ -274,5 +274,37 @@ for (const mode of MODES) {
   }
 }
 
+
+// Отдельно — то, что игрок называет телепортом: сервер разом переставляет
+// машину (отскок после тарана, парковка под колонкой, отклонённое
+// перемещение). Такую поправку корректор обязан провезти, а не прыгнуть.
+console.log("\nРазовая поправка от сервера: машина должна подъехать, а не прыгнуть");
+for (const jump of [80, 200, 400]) {
+  const sm = new PredictionSmoother();
+  sm.set(jump, 0, 0, 0);
+  let worstStep = 0;
+  let seconds = 0;
+  for (let i = 0; i < 60 * 6; i++) {
+    const fix = sm.advance(FRAME, 500);
+    worstStep = Math.max(worstStep, Math.hypot(fix.dx, fix.dy));
+    seconds += FRAME;
+    if (sm.pending < 1) break;
+  }
+  console.log(
+    `  поправка ${String(jump).padStart(3)} px:  ` +
+      `худший кадр ${worstStep.toFixed(1)} px,  свелась за ${seconds.toFixed(2)} с`
+  );
+  // 4 px за кадр — это 240 px/с, вровень с обычной ездой: заметно, но это
+  // именно движение, а не подмена картинки.
+  if (worstStep > 4) {
+    failures++;
+    console.log(`  ПРОВАЛ: поправка ${jump} px прыгнула на ${worstStep.toFixed(1)} px за кадр`);
+  }
+  if (seconds > 4) {
+    failures++;
+    console.log(`  ПРОВАЛ: поправка ${jump} px сводилась ${seconds.toFixed(1)} с — слишком долго`);
+  }
+}
+
 if (failures > 0) throw new Error(`Провалено проверок: ${failures}`);
-console.log("\nOK: машина игрока идёт ровно и от сервера не отстаёт");
+console.log("\nOK: машина игрока идёт ровно, поправки без прыжков, от сервера не отстаёт");

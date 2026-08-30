@@ -95,6 +95,14 @@ interface Skid {
 }
 
 /**
+ * Что делать с положением из серверного состояния: перенести машину мгновенно
+ * (честный телепорт), разобрать по правилам обычной езды или не трогать вовсе —
+ * последнее для ответов на игровые действия, они приходят с устаревшими
+ * координатами.
+ */
+type PositionMode = "snap" | "reconcile" | "stats";
+
+/**
  * Чужая машина в онлайне: `bot` — то, что реально рисуется, `buffer` — история
  * серверных кадров, между которыми идёт интерполяция.
  */
@@ -109,10 +117,15 @@ const MM = 640;
 // а серверное состояние вливается в картинку плавно — иначе машина дёргается на
 // каждом пакете.
 const RECONCILE_BOOST_S = 0.4; // сколько секунд держим ускоренную сходимость
-const RECONCILE_DEADZONE = 1.5; // расхождение меньше — машину не трогаем вовсе, px
-const RECONCILE_DEADZONE_SPEED = 8; // то же по скорости, пикс/с
-const RECONCILE_SNAP = 220; // расхождение больше — сразу ставим машину на место сервера
 const RECONCILE_MAX_LEAD = 0.3; // на сколько максимум продлеваем серверное состояние, с
+// Положение своей машины ведёт клиент, он же сообщает его серверу. Сервер
+// перебивает клиента только там, где он действительно главный, — и даже тогда
+// не рывком, а через корректор.
+const MOVE_SEND_RATE = 20; // как часто отправляем серверу своё положение, 1/с
+const AUTHORITY_TOLERANCE = 260; // насколько сервер вправе расходиться с нами, px
+const AUTHORITY_PATIENCE = 6; // столько снапшотов подряд терпим расхождение
+const MOVE_REJECT_LIMIT = 5; // столько отказов — и руль возвращается серверу
+const OVERRIDE_HOLD = 2; // сколько секунд после отказа слушаемся сервера, с
 // Чужие машины рисуются не «последним пришедшим кадром», а интерполяцией между
 // двумя уже полученными: отрисовка идёт с небольшим отставанием от сети.
 const REMOTE_SNAP = 260; // прыжок больше — это телепорт (респавн, новая карта)
@@ -277,6 +290,13 @@ export class CityRideGame {
   private online: OnlineGameTransport | null = null;
   private onlinePlayerId: string | null = null;
   private onlineInputCd = 0;
+  private onlineMoveCd = 0;
+  // Сколько снапшотов подряд сервер держится своего вопреки нашим координатам,
+  // и сколько ещё секунд слушаемся его после отклонённого перемещения.
+  private serverDisagreement = 0;
+  private serverOverrideCd = 0;
+  private moveRejects = 0;
+  private moveDisabled = false;
   private onlineContacts = new Set<string>();
   private onlinePlayerStatus = "active";
   // Расхождение предсказанной машины с состоянием сервера. Не применяется
@@ -378,6 +398,11 @@ export class CityRideGame {
   setOnlineTransport(transport: OnlineGameTransport | null): void {
     this.online = transport;
     this.onlineInputCd = 0;
+    this.onlineMoveCd = 0;
+    this.serverDisagreement = 0;
+    this.serverOverrideCd = 0;
+    this.moveRejects = 0;
+    this.moveDisabled = false;
     this.onlineContacts.clear();
     this.remoteEntities.clear();
     this.reconcileBoost = 0;
@@ -617,7 +642,7 @@ export class CityRideGame {
   }
 
   applyInteractionResult(result: InteractionResult): void {
-    if (result.player) this.applyServerPlayer(result.player);
+    if (result.player) this.applyServerPlayer(result.player, "stats");
     if (!result.ok || !result.details) return;
     // бустер «Активировать эту АЗС»: сервер открыл именно ту колонку, у которой стоим
     if (result.details.activated === true) {
@@ -809,7 +834,7 @@ export class CityRideGame {
 
   private applyServerPlayer(
     player: PublicPlayerState,
-    mode: "reconcile" | "snap" = "reconcile"
+    mode: PositionMode = "reconcile"
   ): void {
     if (this.onlinePlayerId && player.id !== this.onlinePlayerId) return;
 
@@ -870,67 +895,83 @@ export class CityRideGame {
   }
 
   /**
-   * Кладёт серверное положение на машину игрока. Пока работает локальное
-   * предсказание, разницу не применяем сразу, а отдаём корректору: он подберёт
-   * её за несколько кадров с плавно меняющейся скоростью, поэтому коррекция
-   * читается как лёгкий снос, а не как толчок. Мгновенно двигаем машину только
-   * там, где предсказывать нечего: вход в игру, респавн, гибель и совсем уж
-   * большое расхождение.
+   * Кладёт серверное положение на машину игрока.
+   *
+   * В обычной езде положение своей машины ведёт клиент: он считает физику
+   * каждый кадр и сам сообщает результат серверу (player:move). Поэтому снапшот
+   * положение не трогает вовсе — иначе каждый пакет спорил бы с тем, что игрок
+   * уже видит на экране, и спор этот виден как рывок.
+   *
+   * Сервер перебивает клиента только там, где он действительно главный: вход в
+   * игру, респавн, гибель, смена карты, заправка (машину под колонкой держит
+   * он), отклонённое перемещение и затяжное расхождение — если наши координаты
+   * до него почему-то не доходят. Всё это, кроме честных телепортов, идёт через
+   * корректор и выглядит как подъезд, а не как прыжок.
    */
-  private applyServerPosition(player: PublicPlayerState, mode: "reconcile" | "snap"): void {
+  private applyServerPosition(player: PublicPlayerState, mode: PositionMode): void {
     const c = this.car;
-    const predicting =
-      mode === "reconcile" &&
-      this.phase === "play" &&
-      player.status === "active" &&
-      !!this.online?.connected;
+    const teleport =
+      mode === "snap" ||
+      this.phase !== "play" ||
+      player.status !== "active" ||
+      !this.online?.connected;
 
-    if (!predicting) {
+    if (teleport) {
+      // Вход в заезд, респавн, гибель, оффлайн: предсказывать тут нечего, и
+      // мгновенный перенос здесь и есть правильная картинка.
       c.x = player.x;
       c.y = player.y;
       c.angle = player.angle;
       c.speed = player.speed;
       this.smoother.reset();
       this.reconcileBoost = 0;
+      this.serverDisagreement = 0;
       return;
     }
 
+    // Ответ на игровое действие несёт состояние на момент, когда сервер его
+    // обработал, — оно старее последнего снапшота. Двигать по нему машину нельзя,
+    // и считать по нему расхождение тоже: из-за череды подобранных канистр мы
+    // решили бы, что сервер нас не слышит.
+    if (mode === "stats") return;
+
     // Снапшот показывает машину такой, какой она была примерно RTT назад: наши
-    // команды ещё летели до сервера, ответ летел обратно. Сравнивать его с
-    // текущим предсказанием напрямую нельзя — разница тогда почти вся состоит
-    // из этой задержки, и коррекция постоянно тянет машину назад. Поэтому
-    // сначала продлеваем серверное состояние на задержку вперёд.
+    // команды ещё летели до сервера, ответ летел обратно. Прежде чем сравнивать
+    // его с нашим положением, продлеваем серверное состояние на задержку вперёд.
     const lead = clamp(this.online?.latency ?? 0, 0, RECONCILE_MAX_LEAD);
     const ax = player.x + Math.cos(player.angle) * player.speed * lead;
     const ay = player.y + Math.sin(player.angle) * player.speed * lead;
     const drift = Math.hypot(ax - c.x, ay - c.y);
 
-    if (drift > RECONCILE_SNAP) {
-      // предсказание разошлось с сервером слишком сильно — догонять нечем
-      c.x = player.x;
-      c.y = player.y;
-      c.angle = player.angle;
-      c.speed = player.speed;
-      this.smoother.reset();
-      this.reconcileBoost = 0;
-      return;
+    // Заправка: машину под колонкой держит сервер, своей физики в этот момент
+    // нет. Отклонённое перемещение и выключенный player:move: сервер нас не
+    // слышит, значит рулит он.
+    const serverDrives = player.refueling === true || this.serverOverrideCd > 0 || this.moveDisabled;
+
+    if (!serverDrives) {
+      // Обычная езда. Считаем лишь, насколько сервер с нами согласен: если он
+      // долго держится своего, наши координаты до него не доходят и придётся
+      // подчиниться.
+      this.serverDisagreement = drift > AUTHORITY_TOLERANCE ? this.serverDisagreement + 1 : 0;
+      if (this.serverDisagreement < AUTHORITY_PATIENCE) {
+        // Цель обнуляем, но корректор не сбрасываем: недоделанную поправку он
+        // должен свести к нулю сам, иначе обрыв поправки и будет рывком.
+        this.smoother.set(0, 0, 0, 0);
+        return;
+      }
     }
 
-    const dSpeed = player.speed - c.speed;
-    const dAngle = angleDelta(player.angle, c.angle);
-    if (
-      drift < RECONCILE_DEADZONE &&
-      Math.abs(dSpeed) < RECONCILE_DEADZONE_SPEED &&
-      Math.abs(dAngle) < 0.02
-    ) {
-      // Предсказание совпало с сервером: подбирать нечего. Цель обнуляем, но
-      // корректор не сбрасываем — он должен доехать до нуля сам, иначе резко
-      // оборванная поправка и будет тем самым рывком.
-      this.smoother.set(0, 0, 0, 0);
-      return;
-    }
+    this.smoother.set(ax - c.x, ay - c.y, angleDelta(player.angle, c.angle), player.speed - c.speed);
+  }
 
-    this.smoother.set(ax - c.x, ay - c.y, dAngle, dSpeed);
+  /**
+   * Сервер не принял наше перемещение. Пока разбирается — руль его; если
+   * отказы идут подряд, значит player:move он не поддерживает, и мы совсем
+   * возвращаемся к предсказанию с ведущим сервером.
+   */
+  onServerMovementRejected(): void {
+    this.serverOverrideCd = OVERRIDE_HOLD;
+    if (++this.moveRejects >= MOVE_REJECT_LIMIT) this.moveDisabled = true;
   }
 
   /** подбирает расхождение с сервером понемногу каждый кадр */
@@ -1164,6 +1205,8 @@ export class CityRideGame {
     this.leafCd -= dt;
     this.crashCd -= dt;
     this.onlineInputCd -= dt;
+    this.onlineMoveCd -= dt;
+    this.serverOverrideCd = Math.max(0, this.serverOverrideCd - dt);
 
     const up = this.keys.has("up") && !this.stalled;
     const down = this.keys.has("down");
@@ -1176,8 +1219,22 @@ export class CityRideGame {
       this.onlineInputCd = 1 / 30;
     }
 
-    // Движение считаем сами, кадр в кадр: сеть нужна лишь для того, чтобы
-    // время от времени поправить результат — это делает reconcilePrediction().
+    // Положение своей машины ведёт клиент, поэтому его надо не только нарисовать,
+    // но и сообщить: по этим координатам сервер считает столкновения и показывает
+    // нас остальным. Под колонкой машину держит он сам — там молчим.
+    if (
+      this.onlineMoveCd <= 0 &&
+      !this.moveDisabled &&
+      !this.refueling &&
+      this.onlinePlayerStatus === "active"
+    ) {
+      const c = this.car;
+      transport.sendMove({ x: c.x, y: c.y, angle: c.angle, speed: c.speed });
+      this.onlineMoveCd = 1 / MOVE_SEND_RATE;
+    }
+
+    // Движение считаем сами, кадр в кадр: сеть нужна лишь там, где сервер
+    // главный, и это разбирает applyServerPosition().
     let throttle = 0;
     if (this.refueling || this.onlinePlayerStatus !== "active") {
       // под колонкой и после вылета машина стоит: предсказывать нечего

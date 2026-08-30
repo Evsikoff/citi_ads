@@ -339,6 +339,12 @@ export default function App() {
       onPlayerJoined: (player) => showToast(`${player.name} подключился к заезду`),
       onPlayerLeft: () => showToast("Игрок покинул заезд"),
       onError: (error) => {
+        // Сервер не принял наши координаты: пока он разбирается, машину ведёт
+        // он. Игроку об этом сообщать нечего — это разговор клиента с сервером.
+        if (error.code === "movement-too-fast" || error.code === "stale-sequence") {
+          gameRef.current?.onServerMovementRejected();
+          return;
+        }
         if (networkStatusRef.current === "online") showToast(serverMessage(error.code, error.message));
       },
     });
