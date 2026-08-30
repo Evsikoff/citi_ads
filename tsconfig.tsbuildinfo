@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/components/ClientModal.tsx","./src/game/audio.ts","./src/game/boosters.ts","./src/game/bots.ts","./src/game/car.ts","./src/game/clients.ts","./src/game/config.ts","./src/game/engine.ts","./src/game/online.ts","./src/game/world.ts"],"version":"5.9.3"}

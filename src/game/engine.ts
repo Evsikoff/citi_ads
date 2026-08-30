@@ -7,7 +7,9 @@ import type { Bot } from "./bots";
 import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
 import { CONFIG } from "./config";
 import type {
+  CollisionEvent,
   EntitySnapshot,
+  RefuelEvent,
   InteractionResult,
   OnlineGameTransport,
   PublicPlayerState,
@@ -458,6 +460,84 @@ export class CityRideGame {
     }
   }
 
+  /**
+   * Столкновение, посчитанное сервером. Сама физика (отскок, стан, выпавшие
+   * канистры) приезжает следом снапшотом — здесь только то, что снапшот
+   * передать не может: искры, тряска камеры, звук удара и сообщение игроку.
+   */
+  applyCollision(event: CollisionEvent): void {
+    const mine =
+      !!this.onlinePlayerId &&
+      ((event.rammerIsPlayer && event.rammerId === this.onlinePlayerId) ||
+        (event.victimIsPlayer && event.victimId === this.onlinePlayerId));
+
+    this.crashEffects(event.x, event.y, event.force, mine);
+    if (!mine) return;
+
+    const victimIsMe = event.victimIsPlayer && event.victimId === this.onlinePlayerId;
+    // моя машина участвовала — тряхнём камеру так же, как в офлайне
+    const impulse = victimIsMe ? event.force : event.force * 0.16;
+    this.cam.shake = Math.min(18, this.cam.shake + impulse / 42);
+
+    if (victimIsMe && event.spilled > 0) {
+      // сервер уже уменьшил счётчик; сюда приходит только сообщение игроку
+      for (let i = 0; i < event.spilled * 8; i++) {
+        this.spawn(event.x, event.y, "spark", i % 2 ? CANISTER_ACCENT : "#d8f2ff", 0.5, 110);
+      }
+      this.cb.onCanisterLost(event.spilled, Math.max(0, this.canisters - event.spilled));
+    }
+  }
+
+  /**
+   * Заправка в онлайне идёт на сервере, поэтому звук колонки, конфетти на
+   * полном баке и сообщение о прерванной заправке приезжают событием.
+   */
+  applyRefuelEvent(event: RefuelEvent): void {
+    if (!this.onlinePlayerId || event.playerId !== this.onlinePlayerId) return;
+
+    if (event.state === "started") {
+      this.cam.shake = Math.min(12, this.cam.shake + 6);
+      for (let i = 0; i < 8; i++) {
+        this.spawn(this.car.x, this.car.y, "smoke", "rgba(150,160,178,0.35)", 0.7, 40);
+      }
+      const station = this.city.stations.find((value) => value.id === event.stationId);
+      if (station) {
+        this.stationsActive = Math.max(0, this.stationsActive - 1);
+        this.cb.onStationLock(this.stationsActive, this.city.stations.length);
+      }
+      return;
+    }
+
+    if (event.reason === "full") {
+      sfx.tankFull();
+      for (let i = 0; i < 22; i++) {
+        this.spawn(this.car.x, this.car.y - 10, "confetti", i % 2 ? "#7ee08a" : "#ffe08a", 0.9, 300);
+      }
+    } else if (event.reason === "limit" || event.reason === "money") {
+      this.cb.onRefuelStop(event.reason);
+    }
+  }
+
+  /** Пока идёт серверная заправка, отыгрываем её так же, как офлайн. */
+  private updateOnlineRefuelEffects(dt: number): void {
+    if (!this.refueling) return;
+    this.refuelSndCd -= dt;
+    if (this.refuelSndCd <= 0) {
+      sfx.blip();
+      this.refuelSndCd = 0.15;
+    }
+    if (Math.random() < dt * 24) {
+      this.spawn(
+        this.car.x + (Math.random() - 0.5) * 26,
+        this.car.y + (Math.random() - 0.5) * 26,
+        "spark",
+        "#7ee08a",
+        0.6,
+        70
+      );
+    }
+  }
+
   applyWorldObjects(objects: WorldObjects): void {
     this.city.stations = objects.stations;
     this.city.billboards = objects.billboards;
@@ -483,6 +563,31 @@ export class CityRideGame {
 
   applyInteractionResult(result: InteractionResult): void {
     if (result.player) this.applyServerPlayer(result.player);
+    if (!result.ok || !result.details) return;
+    // бустер «Активировать эту АЗС»: сервер открыл именно ту колонку, у которой стоим
+    if (result.details.activated === true) {
+      const active = Number(result.details.stationsActive);
+      const total = Number(result.details.stationsTotal) || this.city.stations.length;
+      const station = this.city.stations.find((value) => value.id === result.details?.stationId);
+      if (station) {
+        station.state = "active";
+        station.origin = "ad";
+        if (typeof result.details.price === "number") station.price = result.details.price;
+        station.limit =
+          typeof result.details.limit === "number" ? result.details.limit : null;
+        const cx = station.x + station.w / 2;
+        const cy = station.y + station.h / 2;
+        for (let i = 0; i < 18; i++) {
+          this.spawn(cx, cy, "spark", i % 2 ? "#ffd27a" : "#7ee08a", 0.8, 260);
+        }
+      }
+      this.stationsActive = Number.isFinite(active) ? active : this.stationsActive + 1;
+      this.setNearbyInactiveStation(null);
+      sfx.unlock();
+      this.cb.onStationUnlock(this.stationsActive, total, "ad");
+      this.updateNearbyInactiveStation();
+      this.emitHud();
+    }
   }
 
   applyRespawn(player: PublicPlayerState): void {
@@ -501,17 +606,32 @@ export class CityRideGame {
     return this.money;
   }
 
-  /** Атомарно списывает игровую валюту, если на счету хватает денег. */
+  /**
+   * Атомарно списывает игровую валюту, если на счету хватает денег. В онлайне
+   * деньги — состояние сервера: здесь только проверяем баланс, списание уйдёт
+   * вместе с бустером, иначе ближайший снапшот вернул бы потраченное.
+   */
   trySpendMoney(amount: number): boolean {
     const cost = Math.max(0, Math.floor(amount));
     if (!Number.isFinite(cost) || this.money < cost) return false;
+    if (this.online?.connected) return true;
     this.money -= cost;
     this.emitHud();
     return true;
   }
 
-  /** Применяет игровой эффект уже полученного бустера. */
-  applyBooster(systemName: string): { applied: boolean; revived: boolean } {
+  /**
+   * Применяет игровой эффект уже полученного бустера. В онлайне скорость,
+   * расход, топливо и деньги считает сервер, поэтому эффект уходит ему:
+   * начисленное себе локально всё равно затёр бы ближайший снапшот.
+   */
+  applyBooster(systemName: string, cost = 0): { applied: boolean; revived: boolean } {
+    if (this.online?.connected) {
+      // Ответ придёт событием booster-applied: деньги, топливо и множители
+      // приедут в снапшоте, оживление — сообщением player:respawned.
+      return { applied: this.online.booster(systemName, cost) !== null, revived: false };
+    }
+
     const speed = /^speed(\d+(?:\.\d+)?)$/.exec(systemName);
     if (speed) {
       const percent = Number(speed[1]);
@@ -638,11 +758,14 @@ export class CityRideGame {
   ): void {
     if (this.onlinePlayerId && player.id !== this.onlinePlayerId) return;
 
-    const oldFuel = this.fuel;
     const oldCanisters = this.canisters;
-    const fuelAdded = Math.max(0, player.fuel - oldFuel);
+    const wasRefuelling = this.refueling;
 
     this.playerName = player.name;
+    // Отскок после тарана считает сервер. Кладём его в локальное предсказание,
+    // чтобы машину уносило кадр в кадр, а не догоняло рывками через reconcile.
+    this.knock.x = player.kx ?? 0;
+    this.knock.y = player.ky ?? 0;
     this.applyServerPosition(player, mode);
     this.fuel = player.fuel;
     this.fuelMax = player.tankVolume;
@@ -652,19 +775,20 @@ export class CityRideGame {
     this.onlinePlayerStatus = player.status;
     this.stalled = player.status !== "active" || player.fuel <= 0;
 
-    if (fuelAdded > 0.001) {
-      this.sessionLiters += fuelAdded;
-      this.refuelStation = this.city.stations.find((station) =>
-        this.insideRect(this.car.x, this.car.y, station, 8)
-      ) ?? null;
-      this.sessionSpent += fuelAdded * (this.refuelStation?.price ?? 0);
-      this.refueling = this.refuelStation !== null;
-    } else {
-      this.refueling = false;
-      this.refuelStation = null;
-      this.sessionLiters = 0;
-      this.sessionSpent = 0;
+    // Заправку ведёт сервер: он же присылает флаг, колонку и итоги сессии —
+    // раньше клиент угадывал их по приросту топлива, и на мгновенной серверной
+    // заправке это давало заправку «в один кадр».
+    this.refueling = player.refueling === true;
+    this.refuelStation = this.refueling
+      ? this.city.stations.find((station) => station.id === player.refuelStationId) ?? null
+      : null;
+    this.sessionLiters = player.refuelLiters ?? 0;
+    this.sessionSpent = player.refuelSpent ?? 0;
+    if (typeof player.speedMultiplier === "number") this.speedMultiplier = player.speedMultiplier;
+    if (typeof player.fuelConsumptionMultiplier === "number") {
+      this.fuelConsumptionMultiplier = player.fuelConsumptionMultiplier;
     }
+    if (wasRefuelling && !this.refueling) this.refuelSndCd = 0;
 
     if (player.canisters > oldCanisters) {
       this.cb.onCanister(player.canisters, CANISTER_L);
@@ -758,9 +882,9 @@ export class CityRideGame {
       at: null,
       think: 0,
       taken: entity.taken ?? entity.canisters ?? 0,
-      kx: 0,
-      ky: 0,
-      stun: 0,
+      kx: entity.kx ?? 0,
+      ky: entity.ky ?? 0,
+      stun: entity.stun ?? 0,
       style: entity.style ?? 0.9,
       lane: entity.lane ?? 0,
       wob: entity.wobble ?? 0,
@@ -975,6 +1099,7 @@ export class CityRideGame {
     this.topSpeed = Math.max(this.topSpeed, speed);
     this.updateParticles(dt);
     this.fadeSkids(dt);
+    this.updateOnlineRefuelEffects(dt);
     this.updateOnlineInteractions();
     this.updateNearbyInactiveStation();
 
@@ -1015,15 +1140,6 @@ export class CityRideGame {
       contacts.add(key);
       if (!this.onlineContacts.has(key)) {
         transport.interact("canister", canister.id);
-      }
-    }
-
-    for (const station of this.city.stations) {
-      if (!station.id || !this.insideRect(this.car.x, this.car.y, station, 6)) continue;
-      const key = `station:${station.id}`;
-      contacts.add(key);
-      if (!this.onlineContacts.has(key) && station.state === "active") {
-        transport.interact("station", station.id);
       }
     }
 
