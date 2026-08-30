@@ -112,6 +112,8 @@ interface RemoteEntity {
 }
 
 const REV_MAX = 215;
+// Keyboard-friendly assist: counter-steer, stability control and smart throttle.
+const DRIVER_ASSIST = 0.86;
 const MM = 640;
 // Онлайн: своя машина считается локально каждый кадр (клиентское предсказание),
 // а серверное состояние вливается в картинку плавно — иначе машина дёргается на
@@ -1406,6 +1408,7 @@ export class CityRideGame {
       {
         maxForwardSpeed: maxSpeed,
         maxReverseSpeed: REV_MAX,
+        driverAssist: DRIVER_ASSIST,
         surfaceGrip: onRoad ? 1 : 0.56,
         resistance: onRoad ? (this.stalled ? 1.7 : 1) : 3.4,
       }
