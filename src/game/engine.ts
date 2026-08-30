@@ -990,7 +990,7 @@ export class CityRideGame {
     }
     if (player.canisters > oldCanisters) {
       this.cb.onCanister(player.canisters, CANISTER_L);
-      sfx.chime();
+      sfx.canisterPickup();
     }
 
     const speed = Math.abs(player.speed);
@@ -1756,7 +1756,7 @@ export class CityRideGame {
       for (let i = 0; i < 18; i++) {
         this.spawn(k.x, k.y, "spark", i % 2 ? CANISTER_ACCENT : "#d8f2ff", 0.7, 150);
       }
-      sfx.chime();
+      sfx.canisterPickup();
       this.cb.onCanister(this.canisters, CANISTER_L);
     }
   }
