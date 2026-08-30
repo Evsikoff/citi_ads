@@ -4,7 +4,7 @@ import type { Client } from "./clients";
 import { sfx } from "./audio";
 import { createBot, createBots, stepBot } from "./bots";
 import type { Bot } from "./bots";
-import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
+import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED, TURN_RATE, alignStep, grip, stepSteering } from "./car";
 import { CONFIG } from "./config";
 import { SnapshotTimeline, angleDelta, pushSample, sampleTimeline } from "./netclock";
 import type { RemoteSample } from "./netclock";
@@ -371,6 +371,10 @@ export class CityRideGame {
   setPaused(p: boolean): void {
     this.paused = p;
     if (p) {
+      // Зажатое до паузы отпускать некому: сенсорные кнопки вместе с окном
+      // пропадают с экрана, и pointerup по ним уже не придёт. Без сброса машина
+      // после закрытия окна срывалась с места сама.
+      this.keys.clear();
       sfx.engineIdle();
       this.online?.sendInput({
         up: false,
@@ -1423,13 +1427,20 @@ export class CityRideGame {
     }
     c.speed = clamp(c.speed, -REV_MAX, maxSpeed);
 
-    // руль
+    // Руль. Поворачивает не сама клавиша, а положение руля: оно доходит до упора
+    // за доли секунды и так же возвращается к нулю. Из-за этого короткое нажатие
+    // даёт аккуратный доворот, а не рывок на весь угол.
     const dir = (left ? -1 : 0) + (right ? 1 : 0);
     const sp = Math.abs(c.speed);
-    let grip = Math.min(sp / 150, 1) * (1 - 0.42 * (sp / maxSpeed));
-    if (hb) grip *= 1.75;
-    c.angle += dir * 3.1 * grip * (c.speed < -1 ? -1 : 1) * dt;
-    c.steer += (dir - c.steer) * Math.min(1, 10 * dt);
+    c.steer = stepSteering(c.steer, dir, dt);
+    let hold = grip(c.speed, maxSpeed);
+    if (hb) hold *= 1.75;
+    c.angle += c.steer * TURN_RATE * hold * (c.speed < -1 ? -1 : 1) * dt;
+
+    // Выравнивание после поворота: руль отпущен — значит игрок хочет ехать
+    // прямо, и остаток от поворота машина добирает сама, вдоль улицы. Пока за
+    // руль держатся или срывают машину ручником, никакой самодеятельности.
+    if (dir === 0 && !hb && Math.abs(c.steer) < 0.05) c.angle += alignStep(c.angle, c.speed, dt);
 
     // следы юза
     const skidding = (hb && sp > 140) || (dir !== 0 && sp > maxSpeed * 0.68);
@@ -2195,13 +2206,26 @@ export class CityRideGame {
    */
   private collide(interactive = true): void {
     const c = this.car;
+    const hx = Math.cos(c.angle);
+    const hy = Math.sin(c.angle);
+    // Насколько удар пришёлся «в лоб»: 1 — влетели в стену прямо, около нуля —
+    // прошли по ней вскользь. Из всех касаний за кадр берём самое лобовое.
+    let head = 0;
+    const note = (n: { nx: number; ny: number } | null) => {
+      if (n) head = Math.max(head, Math.abs(hx * n.nx + hy * n.ny));
+    };
     let hit = false;
     let billboardContact: Billboard | null = null;
 
     for (const b of this.city.buildings) {
-      if (this.resolveRect(b)) hit = true;
+      const n = this.resolveRect(b);
+      if (n) {
+        hit = true;
+        note(n);
+      }
     }
     for (const b of this.city.billboards) {
+      // щиты не тормозят: в них и надо влетать
       if (this.resolveRect(b)) {
         billboardContact = b;
         // Повторное взаимодействие возможно, но только после того, как игрок
@@ -2235,46 +2259,61 @@ export class CityRideGame {
     if (c.x < CAR_R + 20) {
       c.x = CAR_R + 20;
       hit = true;
+      note({ nx: 1, ny: 0 });
     }
     if (c.x > W - CAR_R - 20) {
       c.x = W - CAR_R - 20;
       hit = true;
+      note({ nx: -1, ny: 0 });
     }
     if (c.y < CAR_R + 20) {
       c.y = CAR_R + 20;
       hit = true;
+      note({ nx: 0, ny: 1 });
     }
     if (c.y > W - CAR_R - 20) {
       c.y = W - CAR_R - 20;
       hit = true;
+      note({ nx: 0, ny: -1 });
     }
 
     if (hit) {
       const sp = Math.abs(c.speed);
-      if (sp > 70) {
-        c.speed *= 0.42;
-        this.cam.shake = Math.min(14, 5 + sp * 0.012);
+      // Гасим только ту часть хода, что пришлась в стену. Раньше любое касание
+      // съедало больше половины скорости, и чиркнуть о дом углом было обиднее,
+      // чем врезаться: теперь по стене машина проезжает, а не встаёт.
+      if (sp > 70 && head > 0.3) {
+        c.speed *= 1 - 0.58 * head;
+        this.cam.shake = Math.min(14, (5 + sp * 0.012) * head);
         for (let i = 0; i < 9; i++) {
-          this.spawn(c.x + Math.cos(c.angle) * 14, c.y + Math.sin(c.angle) * 14, "spark", i % 2 ? "#ffd27a" : "#c9cdd6", 0.35, 210);
+          this.spawn(c.x + hx * 14, c.y + hy * 14, "spark", i % 2 ? "#ffd27a" : "#c9cdd6", 0.35, 210);
         }
         if (this.bumpCd <= 0) {
           this.bumpCd = 0.28;
           sfx.thud();
         }
+      } else if (sp > 70) {
+        // чирк по стене: теряем тем меньше, чем острее угол
+        c.speed *= 1 - 0.6 * head;
+        if (sp > 220) this.spawn(c.x + hx * 14, c.y + hy * 14, "spark", "#c9cdd6", 0.25, 150);
       } else {
         c.speed *= 0.78;
       }
     }
   }
 
-  private resolveRect(r: Rect): boolean {
+  /**
+   * Выталкивает машину из прямоугольника. Возвращает нормаль стены, в которую
+   * упёрлись, — по ней видно, лобовой это удар или касание вскользь.
+   */
+  private resolveRect(r: Rect): { nx: number; ny: number } | null {
     const c = this.car;
     const px = clamp(c.x, r.x, r.x + r.w);
     const py = clamp(c.y, r.y, r.y + r.h);
     const dx = c.x - px;
     const dy = c.y - py;
     const d2 = dx * dx + dy * dy;
-    if (d2 >= CAR_R * CAR_R) return false;
+    if (d2 >= CAR_R * CAR_R) return null;
     const d = Math.sqrt(d2);
     if (d < 0.001) {
       const l = c.x - r.x;
@@ -2282,16 +2321,25 @@ export class CityRideGame {
       const t = c.y - r.y;
       const bt = r.y + r.h - c.y;
       const m = Math.min(l, rt, t, bt);
-      if (m === l) c.x = r.x - CAR_R;
-      else if (m === rt) c.x = r.x + r.w + CAR_R;
-      else if (m === t) c.y = r.y - CAR_R;
-      else c.y = r.y + r.h + CAR_R;
-    } else {
-      const push = (CAR_R - d) / d;
-      c.x += dx * push;
-      c.y += dy * push;
+      if (m === l) {
+        c.x = r.x - CAR_R;
+        return { nx: -1, ny: 0 };
+      }
+      if (m === rt) {
+        c.x = r.x + r.w + CAR_R;
+        return { nx: 1, ny: 0 };
+      }
+      if (m === t) {
+        c.y = r.y - CAR_R;
+        return { nx: 0, ny: -1 };
+      }
+      c.y = r.y + r.h + CAR_R;
+      return { nx: 0, ny: 1 };
     }
-    return true;
+    const push = (CAR_R - d) / d;
+    c.x += dx * push;
+    c.y += dy * push;
+    return { nx: dx / d, ny: dy / d };
   }
 
   private discover(b: Billboard): void {

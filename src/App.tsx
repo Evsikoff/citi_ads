@@ -534,11 +534,14 @@ export default function App() {
   const hold = (k: "up" | "down" | "left" | "right") => ({
     onPointerDown: (e: ReactPointerEvent) => {
       e.preventDefault();
+      // Палец на ходу елозит по экрану и легко съезжает с кнопки. Забираем
+      // указатель себе: пока не отпустили — газ не гаснет и руль не бросает.
+      e.currentTarget.setPointerCapture(e.pointerId);
       gameRef.current?.setKey(k, true);
     },
     onPointerUp: () => gameRef.current?.setKey(k, false),
-    onPointerLeave: () => gameRef.current?.setKey(k, false),
     onPointerCancel: () => gameRef.current?.setKey(k, false),
+    onLostPointerCapture: () => gameRef.current?.setKey(k, false),
   });
 
   const playerLeaderboardIndex = leaderboard.findIndex((entry) => entry.isPlayer);
