@@ -134,6 +134,7 @@ const PLAYERS = 1 + CONFIG.botCount; // участников заезда: иг�
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
 const CANISTER_L = CONFIG.canisterTankBonus;
 const INACTIVE_STATION_PROXIMITY = 120; // расстояние от края площадки для показа контекстного бустера
+const REFUELING_HEARING_DISTANCE = 800; // дальше этого расстояния чужую АЗС не слышно
 // T = базовый таймаут + надбавка за каждую канистру, оба значения из config.ts
 const refuelDuration = (canisters: number): number =>
   Math.max(0, CONFIG.stationTimeoutBase + CONFIG.stationTimeoutPerCanister * Math.max(0, canisters));
@@ -264,7 +265,6 @@ export class CityRideGame {
   private refueling = false;
   private stalled = false;
   private gameOverSent = false;
-  private refuelSndCd = 0;
   private warnCd = 0;
   private stationsActive = 0;
   private refuelStation: Station | null = null; // где сейчас идёт заправка
@@ -569,8 +569,8 @@ export class CityRideGame {
   }
 
   /**
-   * Заправка в онлайне идёт на сервере, поэтому звук колонки, конфетти на
-   * полном баке и сообщение о прерванной заправке приезжают событием.
+   * Заправка в онлайне идёт на сервере, поэтому конфетти на полном баке и
+   * сообщение о прерванной заправке приезжают событием.
    */
   applyRefuelEvent(event: RefuelEvent): void {
     if (!this.onlinePlayerId || event.playerId !== this.onlinePlayerId) return;
@@ -598,14 +598,9 @@ export class CityRideGame {
     }
   }
 
-  /** Пока идёт серверная заправка, отыгрываем её так же, как офлайн. */
+  /** Пока идёт серверная заправка, отыгрываем её визуально так же, как офлайн. */
   private updateOnlineRefuelEffects(dt: number): void {
     if (!this.refueling) return;
-    this.refuelSndCd -= dt;
-    if (this.refuelSndCd <= 0) {
-      sfx.blip();
-      this.refuelSndCd = 0.15;
-    }
     if (Math.random() < dt * 24) {
       this.spawn(
         this.car.x + (Math.random() - 0.5) * 26,
@@ -804,6 +799,7 @@ export class CityRideGame {
     window.removeEventListener("keyup", this.onKeyUp);
     window.removeEventListener("blur", this.onBlur);
     window.removeEventListener("resize", this.onResize);
+    sfx.stopAllRefueling();
     sfx.engineIdle();
   }
 
@@ -839,7 +835,6 @@ export class CityRideGame {
     if (this.onlinePlayerId && player.id !== this.onlinePlayerId) return;
 
     const oldCanisters = this.canisters;
-    const wasRefuelling = this.refueling;
 
     this.playerName = player.name;
     // Отскок после тарана считает сервер, а гасим мы его локально каждый кадр.
@@ -876,8 +871,6 @@ export class CityRideGame {
     if (typeof player.fuelConsumptionMultiplier === "number") {
       this.fuelConsumptionMultiplier = player.fuelConsumptionMultiplier;
     }
-    if (wasRefuelling && !this.refueling) this.refuelSndCd = 0;
-
     if (player.canisters > oldCanisters) {
       this.cb.onCanister(player.canisters, CANISTER_L);
       sfx.chime();
@@ -1180,6 +1173,7 @@ export class CityRideGame {
         this.reconcilePrediction(dt);
         this.updateRemoteEntities(dt);
       }
+      this.syncRefuelingSounds();
     }
     this.render(dt);
   };
@@ -1875,6 +1869,38 @@ export class CityRideGame {
     }
   }
 
+  /**
+   * Запись своей колонки слышна полностью. Записи колонок соперников затихают
+   * по мере удаления машины игрока от площадки и неслышны за пределами радиуса.
+   */
+  private syncRefuelingSounds(): void {
+    const sounds = new Map<string, number>();
+    if (this.refueling && this.refuelStation) sounds.set("player", 1);
+
+    if (this.online?.connected) {
+      for (const [id, entity] of this.remoteEntities) {
+        if (entity.bot.wait <= 0 || !entity.bot.at) continue;
+        sounds.set(`remote:${id}`, this.refuelingVolumeAt(entity.bot.at));
+      }
+    } else {
+      for (let index = 0; index < this.bots.length; index++) {
+        const bot = this.bots[index];
+        if (bot.wait <= 0 || !bot.at) continue;
+        sounds.set(`bot:${index}`, this.refuelingVolumeAt(bot.at));
+      }
+    }
+
+    sfx.syncRefueling(sounds);
+  }
+
+  private refuelingVolumeAt(station: Station): number {
+    const nearestX = clamp(this.car.x, station.x, station.x + station.w);
+    const nearestY = clamp(this.car.y, station.y, station.y + station.h);
+    const distance = Math.hypot(this.car.x - nearestX, this.car.y - nearestY);
+    const proximity = clamp(1 - distance / REFUELING_HEARING_DISTANCE, 0, 1);
+    return proximity ** 1.5;
+  }
+
   /** боты гоняют на скорости игрока, так что в стены их тоже надо не пускать */
   private keepBotOutOfWalls(b: Bot): void {
     for (const q of this.city.buildings) {
@@ -2017,11 +2043,6 @@ export class CityRideGame {
       this.totalLitersFilled += filled;
       if (filled > 0) this.leaderboardDirty = true;
       this.sessionSpent += paid;
-      this.refuelSndCd -= dt;
-      if (this.refuelSndCd <= 0) {
-        sfx.blip();
-        this.refuelSndCd = 0.15;
-      }
       if (Math.random() < dt * 24) {
         this.spawn(c.x + (Math.random() - 0.5) * 26, c.y + (Math.random() - 0.5) * 26, "spark", "#7ee08a", 0.6, 70);
       }

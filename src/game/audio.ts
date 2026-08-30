@@ -1,4 +1,13 @@
-/** Крошечный WebAudio-синтезатор: гул мотора, сигналы, удары. Без внешних ассетов. */
+interface RefuelingVoice {
+  source: AudioBufferSourceNode;
+  gain: GainNode;
+  target: number;
+}
+
+const REFUELING_VOLUME = 0.6;
+const REFUELING_FADE_TIME = 0.12;
+
+/** WebAudio-эффекты игры: синтезатор и зацикленные записи заправки. */
 class Sfx {
   private ac: AudioContext | null = null;
   private master: GainNode | null = null;
@@ -9,6 +18,15 @@ class Sfx {
   private engineOn = false;
   muted = false;
   private wasMutedByBlur = false;
+  private refuelingBuffers: AudioBuffer[] = [];
+  private refuelingLoadAttempted = false;
+  private refuelingLoad: Promise<void> | null = null;
+  private refuelingTargets = new Map<string, number>();
+  private refuelingVoices = new Map<string, RefuelingVoice>();
+  private readonly refuelingFiles = [
+    new URL("../sound/effects/refueling/Refueling1.mp3", import.meta.url).href,
+    new URL("../sound/effects/refueling/Refueling2.mp3", import.meta.url).href,
+  ];
 
   init(): void {
     try {
@@ -22,6 +40,7 @@ class Sfx {
         this.master.connect(this.ac.destination);
       }
       if (this.ac.state === "suspended") void this.ac.resume();
+      this.loadRefuelingBuffers();
     } catch {
       this.ac = null;
     }
@@ -159,9 +178,114 @@ class Sfx {
     this.tone([880, 640], 0.15, "square", 0.06, 0);
   }
 
-  /** капля бензина при заправке */
-  blip(): void {
-    this.tone([1500 + Math.random() * 260], 0.05, "sine", 0.05, 0);
+  /**
+   * Синхронизирует зацикленные записи заправки с активными машинами.
+   * Значение громкости нормализовано от 0 до 1; отсутствующие ключи плавно
+   * затухают и останавливаются. Один ключ сохраняет случайно выбранную запись
+   * до конца одной заправки.
+   */
+  syncRefueling(targets: ReadonlyMap<string, number>): void {
+    this.refuelingTargets = new Map(
+      [...targets].map(([id, volume]) => [id, Math.max(0, Math.min(1, volume))])
+    );
+    this.applyRefuelingTargets();
+    this.loadRefuelingBuffers();
+  }
+
+  stopAllRefueling(): void {
+    this.refuelingTargets.clear();
+    this.applyRefuelingTargets();
+  }
+
+  private loadRefuelingBuffers(): void {
+    const ac = this.ac;
+    if (!ac || this.refuelingLoadAttempted || this.refuelingLoad) return;
+    this.refuelingLoadAttempted = true;
+
+    this.refuelingLoad = Promise.all(
+      this.refuelingFiles.map(async (file): Promise<AudioBuffer | null> => {
+        try {
+          const response = await fetch(file);
+          if (!response.ok) return null;
+          return await ac.decodeAudioData(await response.arrayBuffer());
+        } catch {
+          return null;
+        }
+      })
+    )
+      .then((buffers) => {
+        if (this.ac !== ac) return;
+        this.refuelingBuffers = buffers.filter((buffer): buffer is AudioBuffer => buffer !== null);
+        this.applyRefuelingTargets();
+      })
+      .finally(() => {
+        this.refuelingLoad = null;
+      });
+  }
+
+  private applyRefuelingTargets(): void {
+    const ac = this.ac;
+    const master = this.master;
+    if (!ac || !master) return;
+
+    for (const [id, voice] of this.refuelingVoices) {
+      const volume = this.refuelingTargets.get(id);
+      if (volume === undefined) {
+        this.stopRefuelingVoice(id, voice);
+        continue;
+      }
+      const target = volume * REFUELING_VOLUME;
+      if (Math.abs(voice.target - target) < 0.002) continue;
+      voice.target = target;
+      voice.gain.gain.cancelScheduledValues(ac.currentTime);
+      voice.gain.gain.setTargetAtTime(target, ac.currentTime, REFUELING_FADE_TIME);
+    }
+
+    if (this.refuelingBuffers.length === 0) return;
+    for (const [id, volume] of this.refuelingTargets) {
+      if (this.refuelingVoices.has(id)) continue;
+      try {
+        const source = ac.createBufferSource();
+        source.buffer =
+          this.refuelingBuffers[Math.floor(Math.random() * this.refuelingBuffers.length)];
+        source.loop = true;
+        const gain = ac.createGain();
+        gain.gain.setValueAtTime(0, ac.currentTime);
+        gain.gain.setTargetAtTime(
+          volume * REFUELING_VOLUME,
+          ac.currentTime,
+          REFUELING_FADE_TIME
+        );
+        source.connect(gain);
+        gain.connect(master);
+
+        const voice = { source, gain, target: volume * REFUELING_VOLUME };
+        this.refuelingVoices.set(id, voice);
+        source.onended = () => {
+          if (this.refuelingVoices.get(id) === voice) this.refuelingVoices.delete(id);
+          source.disconnect();
+          gain.disconnect();
+        };
+        source.start();
+      } catch {
+        /* тишина */
+      }
+    }
+  }
+
+  private stopRefuelingVoice(id: string, voice: RefuelingVoice): void {
+    const ac = this.ac;
+    this.refuelingVoices.delete(id);
+    if (!ac) return;
+    try {
+      voice.target = 0;
+      voice.gain.gain.cancelScheduledValues(ac.currentTime);
+      voice.gain.gain.setTargetAtTime(0, ac.currentTime, REFUELING_FADE_TIME / 2);
+      voice.source.stop(ac.currentTime + REFUELING_FADE_TIME * 2);
+    } catch {
+      voice.source.disconnect();
+      voice.gain.disconnect();
+    }
   }
 
   /** бак полон */
