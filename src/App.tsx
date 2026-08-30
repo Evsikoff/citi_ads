@@ -324,12 +324,14 @@ export default function App() {
         gameRef.current?.applyServerLeaderboard(rows);
       },
       onInteractionResult: (result) => {
-        gameRef.current?.applyInteractionResult(result);
+        // Отказы по щитам движок разбирает сам (повтор, свой текст) — тогда
+        // дублировать их сообщением сервера не нужно.
+        const handled = gameRef.current?.applyInteractionResult(result);
         resolveStationBooster(result.requestId, result.ok);
-        if (!result.ok) showToast(serverMessage(result.code, result.message));
+        if (!result.ok && !handled) showToast(serverMessage(result.code, result.message));
       },
       onGameEventResult: (result) => {
-        gameRef.current?.applyInteractionResult(result);
+        const handled = gameRef.current?.applyInteractionResult(result);
         if (result.event === "booster-applied") {
           if (!result.ok) {
             showToast(
@@ -343,7 +345,7 @@ export default function App() {
           if (result.details?.revived) setGameover(null);
           return;
         }
-        if (!result.ok) showToast(serverMessage(result.code, result.message));
+        if (!result.ok && !handled) showToast(serverMessage(result.code, result.message));
       },
       onPlayerRespawned: (player) => {
         gameRef.current?.applyRespawn(player);
@@ -358,9 +360,16 @@ export default function App() {
           gameRef.current?.onServerMovementRejected();
           return;
         }
-        // Отказ мог прийти и ошибкой — тогда бустер тоже остаётся неистраченным.
-        if (error.requestId) resolveStationBooster(error.requestId, false);
-        if (networkStatusRef.current === "online") showToast(serverMessage(error.code, error.message));
+        // Отказ мог прийти и ошибкой — тогда бустер тоже остаётся неистраченным,
+        // а запрос по щиту движок повторит сам.
+        let handled = false;
+        if (error.requestId) {
+          resolveStationBooster(error.requestId, false);
+          handled = !!gameRef.current?.applyRequestFailure(error.requestId, error.code);
+        }
+        if (!handled && networkStatusRef.current === "online") {
+          showToast(serverMessage(error.code, error.message));
+        }
       },
     });
     networkRef.current = network;

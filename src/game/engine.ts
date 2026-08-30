@@ -155,6 +155,11 @@ const INACTIVE_STATION_PROXIMITY = 120; // расстояние от края п
 // заправки.
 const INACTIVE_STATION_REACH = 6;
 const REFUELING_HEARING_DISTANCE = 800; // дальше этого расстояния чужую АЗС не слышно
+// Сервер проверяет дистанцию по последнему player:move, и на скорости он успевает
+// отстать: щит под колёсами для него ещё далеко. Такой отказ не окончательный —
+// досылаем позицию и пробуем снова, не сходя с места.
+const BILLBOARD_RETRY_DELAY = 0.4; // пауза между повторами, с
+const BILLBOARD_RETRY_LIMIT = 4; // столько попыток на одно касание
 // T = базовый таймаут + надбавка за каждую канистру, оба значения из config.ts
 const refuelDuration = (canisters: number): number =>
   Math.max(0, CONFIG.stationTimeoutBase + CONFIG.stationTimeoutPerCanister * Math.max(0, canisters));
@@ -319,6 +324,13 @@ export class CityRideGame {
   private moveRejects = 0;
   private moveDisabled = false;
   private onlineContacts = new Set<string>();
+  // Запросы по щитам, отправленные серверу: requestId → id щита. Пока ответа
+  // нет, повторно тот же щит не дёргаем.
+  private billboardRequests = new Map<string, string>();
+  // Щиты, по которым сервер ответил «too-far»: ждём паузу и пробуем снова, не
+  // сходя с места. Значение — сколько секунд осталось ждать.
+  private billboardRetry = new Map<string, number>();
+  private billboardAttempts = new Map<string, number>();
   private onlinePlayerStatus = "active";
   // Расхождение предсказанной машины с состоянием сервера. Не применяется
   // рывком: корректор подбирает его с ограниченной и плавно меняющейся
@@ -429,6 +441,7 @@ export class CityRideGame {
     this.moveRejects = 0;
     this.moveDisabled = false;
     this.onlineContacts.clear();
+    this.forgetBillboardRequests();
     this.remoteEntities.clear();
     this.reconcileBoost = 0;
     this.timeline.reset();
@@ -661,9 +674,16 @@ export class CityRideGame {
     );
   }
 
-  applyInteractionResult(result: InteractionResult): void {
+  /**
+   * Ответ сервера на игровое действие. Возвращает true, если движок сам всё
+   * объяснил игроку и показывать сообщение об ошибке не нужно.
+   */
+  applyInteractionResult(result: InteractionResult): boolean {
     if (result.player) this.applyServerPlayer(result.player, "stats");
-    if (!result.ok || !result.details) return;
+    if (this.billboardRequests.has(result.requestId)) {
+      return this.applyBillboardResult(result.requestId, result.ok, result.code);
+    }
+    if (!result.ok || !result.details) return false;
     // бустер «Активировать эту АЗС»: сервер открыл именно ту колонку, у которой стоим
     if (result.details.activated === true) {
       const active = Number(result.details.stationsActive);
@@ -688,6 +708,62 @@ export class CityRideGame {
       this.updateNearbyInactiveStation();
       this.emitHud();
     }
+    return false;
+  }
+
+  /**
+   * Ответ по рекламному щиту. Карточку клиента и таймаут показываем только на
+   * подтверждение сервера: раньше клиент рисовал их сразу после отправки, и
+   * отказ выглядел как сработавшее взаимодействие, после которого ничего не
+   * происходит. Отказ «too-far» не окончательный — сервер мерил по устаревшей
+   * позиции, поэтому пробуем ещё раз, не сходя со щита.
+   */
+  private applyBillboardResult(requestId: string, ok: boolean, code: string): boolean {
+    const id = this.billboardRequests.get(requestId);
+    this.billboardRequests.delete(requestId);
+    if (!id) return false;
+
+    const billboard = this.city.billboards.find((value) => value.id === id);
+    if (!ok) {
+      const attempts = this.billboardAttempts.get(id) ?? 0;
+      if (code === "too-far" && attempts < BILLBOARD_RETRY_LIMIT) {
+        this.billboardRetry.set(id, BILLBOARD_RETRY_DELAY);
+        return true;
+      }
+      if (code === "all-stations-active") {
+        this.cb.onBillboardUnavailable();
+        return true;
+      }
+      return false;
+    }
+
+    this.billboardAttempts.delete(id);
+    this.billboardRetry.delete(id);
+    if (!billboard) return false;
+
+    // Своё состояние щита ставим сразу, не дожидаясь world:objects: иначе тот
+    // же щит успеет уйти на сервер повторным запросом.
+    billboard.discovered = true;
+    billboard.state = "done";
+    billboard.cooldown = CONFIG.billboardTimeout;
+    const cx = billboard.x + billboard.w / 2;
+    const cy = billboard.y + billboard.h / 2 - 20;
+    const colors = [billboard.client.color, "#fdf3e0", "#ffd27a", shade(billboard.client.color, 0.75)];
+    for (let i = 0; i < 30; i++) {
+      this.spawn(cx, cy, "confetti", colors[i % colors.length], 0.95, 330);
+    }
+    sfx.chime();
+    this.cb.onDiscover(billboard.client, this.city.billboards.indexOf(billboard) + 1);
+    return true;
+  }
+
+  /**
+   * Отказ пришёл отдельным server:error, а не ответом на действие. Разбираем
+   * его так же: по нашему щиту это тот же самый отказ.
+   */
+  applyRequestFailure(requestId: string, code: string): boolean {
+    if (!this.billboardRequests.has(requestId)) return false;
+    return this.applyBillboardResult(requestId, false, code);
   }
 
   applyRespawn(player: PublicPlayerState): void {
@@ -850,6 +926,7 @@ export class CityRideGame {
     this.usedStation = null;
     this.billboardContact = null;
     this.onlineContacts.clear();
+    this.forgetBillboardRequests();
     this.afterObjectsChanged();
     this.paintMinimapBase();
   }
@@ -1289,6 +1366,7 @@ export class CityRideGame {
     this.updateParticles(dt);
     this.fadeSkids(dt);
     this.updateOnlineRefuelEffects(dt);
+    this.tickBillboardRetries(dt);
     this.updateOnlineInteractions();
     this.updateNearbyInactiveStation();
 
@@ -1328,6 +1406,8 @@ export class CityRideGame {
       const key = `canister:${canister.id}`;
       contacts.add(key);
       if (!this.onlineContacts.has(key)) {
+        // Дистанцию сервер меряет по последней присланной позиции — досылаем её.
+        this.pushPositionToServer();
         transport.interact("canister", canister.id);
       }
     }
@@ -1335,15 +1415,18 @@ export class CityRideGame {
     for (const billboard of this.city.billboards) {
       if (!billboard.id || !touchRect(billboard)) continue;
       const key = `billboard:${billboard.id}`;
+      const id = billboard.id;
       contacts.add(key);
+      // Ответа по этому щиту ещё нет либо ждём паузу перед повтором.
+      if (this.billboardRetry.has(id)) continue;
       if (this.onlineContacts.has(key) || billboard.state !== "ready") continue;
-      if (!this.hasInactiveStations()) {
-        this.cb.onBillboardUnavailable();
-        continue;
-      }
-      transport.interact("billboard", billboard.id);
-      this.cb.onDiscover(billboard.client, this.city.billboards.indexOf(billboard) + 1);
-      sfx.chime();
+      // Занята ли ещё хоть одна АЗС, решает сервер: у него состояние заправок
+      // свежее нашего, а отказ он объяснит кодом all-stations-active.
+      this.pushPositionToServer();
+      const requestId = transport.interact("billboard", id);
+      if (!requestId) continue;
+      this.billboardRequests.set(requestId, id);
+      this.billboardAttempts.set(id, (this.billboardAttempts.get(id) ?? 0) + 1);
     }
 
     const base = this.city.base;
@@ -1356,6 +1439,37 @@ export class CityRideGame {
     }
 
     this.onlineContacts = contacts;
+
+    // Съехали со щита — счётчик попыток и пауза больше не нужны. Сам запрос
+    // ждёт ответа и после отъезда: сервер мог его принять, и карточку клиента
+    // игрок увидит, даже если уже проехал мимо.
+    for (const id of [...this.billboardAttempts.keys()]) {
+      if (contacts.has(`billboard:${id}`)) continue;
+      this.billboardAttempts.delete(id);
+      this.billboardRetry.delete(id);
+    }
+  }
+
+  /** Забывает незакрытые запросы по щитам: карта или соединение сменились. */
+  private forgetBillboardRequests(): void {
+    this.billboardRequests.clear();
+    this.billboardRetry.clear();
+    this.billboardAttempts.clear();
+  }
+
+  /** Отсчитывает паузы перед повторными запросами по щитам. */
+  private tickBillboardRetries(dt: number): void {
+    for (const [id, left] of [...this.billboardRetry]) {
+      const remaining = left - dt;
+      if (remaining > 0) {
+        this.billboardRetry.set(id, remaining);
+        continue;
+      }
+      this.billboardRetry.delete(id);
+      // Машина со щита не съезжала, поэтому касание надо «переоткрыть» — иначе
+      // повтор пойдёт только после нового наезда.
+      this.onlineContacts.delete(`billboard:${id}`);
+    }
   }
 
   private update(dt: number): void {
