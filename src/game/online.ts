@@ -216,6 +216,8 @@ export type ObjectType = "billboard" | "station" | "canister" | "base";
 
 export interface OnlineGameTransport {
   readonly connected: boolean;
+  /** Замеренное время оборота пакета, секунды. 0 — пока не измерено. */
+  readonly latency: number;
   sendInput(input: PlayerControls): void;
   sendMove(position: Pick<PublicPlayerState, "x" | "y" | "angle" | "speed">): void;
   interact(objectType: ObjectType, objectId: string, amount?: number): string | null;
@@ -277,6 +279,8 @@ export class MultiplayerClient implements OnlineGameTransport {
   private worldRevision = 0;
   private gameReady = false;
   private pingTimer = 0;
+  private pingSentAt = 0;
+  private rtt = 0;
   private disposed = false;
   private status: ConnectionStatus = "connecting";
 
@@ -289,6 +293,14 @@ export class MultiplayerClient implements OnlineGameTransport {
 
   get connected(): boolean {
     return this.status === "online" && this.socket?.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Время оборота пакета в секундах. Движку оно нужно, чтобы понимать, на
+   * сколько состояние в снапшоте отстало от того, что игрок уже видит у себя.
+   */
+  get latency(): number {
+    return this.rtt;
   }
 
   connect(timeoutMs = 5000): Promise<boolean> {
@@ -356,6 +368,7 @@ export class MultiplayerClient implements OnlineGameTransport {
     this.moveSeq = 0;
     this.worldRevision = 0;
     this.gameReady = false;
+    this.rtt = 0;
     this.send("player:join", { name });
   }
 
@@ -461,8 +474,19 @@ export class MultiplayerClient implements OnlineGameTransport {
   private route(message: ServerEnvelope): void {
     switch (message.type) {
       case "server:hello":
-      case "pong":
         return;
+      case "pong": {
+        // Половина этого времени — то, на сколько серверный снапшот отстал от
+        // клиента. Сглаживаем, чтобы один медленный пакет не сдвинул оценку.
+        const payload = message.payload as { clientTime?: number } | null;
+        const sent =
+          typeof payload?.clientTime === "number" ? payload.clientTime : this.pingSentAt;
+        if (sent > 0) {
+          const sample = Math.max(0, Date.now() - sent) / 1000;
+          if (sample < 2) this.rtt = this.rtt > 0 ? this.rtt + (sample - this.rtt) * 0.25 : sample;
+        }
+        return;
+      }
       case "player:welcome": {
         const payload = message.payload as { playerId: string; player: PublicPlayerState };
         this.listeners.onWelcome?.(payload.playerId, payload.player);
@@ -555,9 +579,14 @@ export class MultiplayerClient implements OnlineGameTransport {
 
   private startPing(): void {
     this.stopPing();
-    this.pingTimer = window.setInterval(() => {
-      this.send("ping", { clientTime: Date.now() });
-    }, 15000);
+    // Раз в две секунды: пинг заодно держит соединение живым, но главное — по
+    // нему движок узнаёт текущую задержку, а она за 15 секунд успевает уплыть.
+    const beat = () => {
+      this.pingSentAt = Date.now();
+      this.send("ping", { clientTime: this.pingSentAt });
+    };
+    beat();
+    this.pingTimer = window.setInterval(beat, 2000);
   }
 
   private stopPing(): void {

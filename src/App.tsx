@@ -276,6 +276,10 @@ export default function App() {
           showToast("Связь с сервером потеряна — продолжаем локально");
         }
       },
+      onHello: (hello) => {
+        // частоты сервера нужны движку, чтобы рассчитать буфер интерполяции
+        gameRef.current?.setOnlineTiming(hello);
+      },
       onWelcome: (playerId, player) => {
         gameRef.current?.setOnlinePlayer(playerId, player);
       },

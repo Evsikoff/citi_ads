@@ -6,6 +6,8 @@ import { createBot, createBots, stepBot } from "./bots";
 import type { Bot } from "./bots";
 import { ACC, BRAKE, CAR_R, KMH, MAX_SPEED } from "./car";
 import { CONFIG } from "./config";
+import { SnapshotTimeline, angleDelta, pushSample, sampleTimeline } from "./netclock";
+import type { RemoteSample } from "./netclock";
 import type {
   CollisionEvent,
   EntitySnapshot,
@@ -14,6 +16,7 @@ import type {
   OnlineGameTransport,
   PublicPlayerState,
   RemoteEntityState,
+  ServerHello,
   ServerCity,
   ServerLeaderboardEntry,
   WorldObjects,
@@ -91,27 +94,30 @@ interface Skid {
 }
 
 /**
- * Чужая машина в онлайне: `bot` — то, что реально рисуется и едет плавно,
- * остальные поля — последняя серверная цель, к которой его подтягиваем.
+ * Чужая машина в онлайне: `bot` — то, что реально рисуется, `buffer` — история
+ * серверных кадров, между которыми идёт интерполяция.
  */
 interface RemoteEntity {
   bot: Bot;
-  x: number;
-  y: number;
-  angle: number;
-  speed: number;
-  age: number; // сколько секунд прошло с последнего снапшота
+  buffer: RemoteSample[];
 }
 
 const REV_MAX = 215;
 const MM = 640;
-// Онлайн: движение машины считается локально каждый кадр, а серверные снапшоты
-// вливаются в картинку плавно — иначе машина дёргается на каждом пакете.
+// Онлайн: своя машина считается локально каждый кадр (клиентское предсказание),
+// а серверное состояние вливается в картинку плавно — иначе машина дёргается на
+// каждом пакете.
 const RECONCILE_RATE = 7; // насколько быстро гасим расхождение с сервером, 1/с
+const RECONCILE_RATE_HARD = 20; // ускоренная сходимость сразу после тарана
+const RECONCILE_BOOST_S = 0.4; // сколько секунд держим ускоренную сходимость
+const RECONCILE_DEADZONE = 1.5; // расхождение меньше — машину не трогаем вовсе, px
+const RECONCILE_DEADZONE_SPEED = 8; // то же по скорости, пикс/с
 const RECONCILE_SNAP = 220; // расхождение больше — сразу ставим машину на место сервера
-const REMOTE_SMOOTH_RATE = 12; // с какой скоростью чужие машины подтягиваются к цели
-const REMOTE_SNAP = 260; // расхождение больше — телепорт вместо догонялок
-const REMOTE_EXTRAPOLATE_S = 0.35; // сколько продлеваем чужое движение без новых данных
+const RECONCILE_MAX_LEAD = 0.3; // на сколько максимум продлеваем серверное состояние, с
+// Чужие машины рисуются не «последним пришедшим кадром», а интерполяцией между
+// двумя уже полученными: отрисовка идёт с небольшим отставанием от сети.
+const REMOTE_SNAP = 260; // прыжок больше — это телепорт (респавн, новая карта)
+const REMOTE_BUFFER = 24; // сколько серверных кадров держим на каждую машину
 const PLAYERS = 1 + CONFIG.botCount; // участников заезда: игрок и боты
 const CANISTERS_ON_MAP = PLAYERS + 1; // канистр по карте: участников + 1
 const CANISTER_L = CONFIG.canisterTankBonus;
@@ -122,14 +128,6 @@ const refuelDuration = (canisters: number): number =>
 const M_PER_PX = 0.35; // метров в мировом пикселе — для подписей с дистанцией
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
-
-/** кратчайший поворот от одного угла к другому, в диапазоне (-π, π] */
-function angleDelta(to: number, from: number): number {
-  let d = (to - from) % (Math.PI * 2);
-  if (d > Math.PI) d -= Math.PI * 2;
-  if (d < -Math.PI) d += Math.PI * 2;
-  return d;
-}
 
 const PLAYER_COLOR = "#e5472f"; // машина игрока — единственная красная
 
@@ -285,12 +283,11 @@ export class CityRideGame {
   // Расхождение предсказанной машины с последним состоянием сервера. Не
   // применяется рывком: reconcilePrediction() размазывает его по кадрам.
   private serverError = { x: 0, y: 0, angle: 0, speed: 0 };
+  private reconcileBoost = 0; // секунды ускоренной сходимости после тарана
   // Чужие машины и боты: отрисовка отдельно от того, что прислал сервер.
   private remoteEntities = new Map<string, RemoteEntity>();
-  // После серверного тарана не интерполируем старое положение: офлайн-физика
-  // тоже применяет расталкивание и отскок в тот же кадр.
-  private collisionSnapEntities = new Set<string>();
-  private collisionSnapPlayer = false;
+  // Общая временная шкала серверных кадров и запас отрисовки по ней.
+  private timeline = new SnapshotTimeline();
 
   private onKeyDown: (e: KeyboardEvent) => void;
   private onKeyUp: (e: KeyboardEvent) => void;
@@ -383,13 +380,18 @@ export class CityRideGame {
     this.onlineInputCd = 0;
     this.onlineContacts.clear();
     this.remoteEntities.clear();
-    this.collisionSnapEntities.clear();
-    this.collisionSnapPlayer = false;
+    this.reconcileBoost = 0;
+    this.timeline.reset();
     this.resetServerError();
     if (!transport) {
       this.onlinePlayerId = null;
       this.onlinePlayerStatus = "active";
     }
+  }
+
+  /** Частоты сервера из приветствия: по ним считается буфер интерполяции. */
+  setOnlineTiming(hello: ServerHello): void {
+    this.timeline.configure(hello.tickRate, hello.snapshotRate);
   }
 
   setOnlinePlayer(playerId: string, player: PublicPlayerState): void {
@@ -408,6 +410,7 @@ export class CityRideGame {
   }
 
   applyEntities(snapshot: EntitySnapshot): void {
+    const t = this.trackSnapshotClock(snapshot);
     const me = this.onlinePlayerId
       ? snapshot.players.find((player) => player.id === this.onlinePlayerId)
       : undefined;
@@ -419,61 +422,90 @@ export class CityRideGame {
         (player) => player.id !== this.onlinePlayerId && player.status === "active"
       ),
     ];
-    this.syncRemoteEntities(others);
+    this.syncRemoteEntities(others, t);
+  }
+
+  /** монотонные локальные часы в секундах — не зависят от системного времени */
+  private netNow(): number {
+    return (typeof performance !== "undefined" ? performance.now() : Date.now()) / 1000;
   }
 
   /**
-   * Серверные координаты чужих машин кладём в цель, а нарисованное положение
-   * оставляем прежним: до неё машина доедет за несколько кадров в
-   * updateRemoteEntities(). Иначе каждый снапшот выглядит как телепорт.
+   * Ставит снапшот на общую временную шкалу. Сдвинулась оценка задержки — вместе
+   * с ней едет и вся шкала: переносим на неё уже накопленные кадры, иначе новые
+   * оказались бы «раньше» старых и буфер перестал бы принимать данные.
    */
-  private syncRemoteEntities(entities: RemoteEntityState[]): void {
+  private trackSnapshotClock(snapshot: EntitySnapshot): number {
+    const stamp = this.timeline.stamp(snapshot.tick, this.netNow());
+    if (stamp.restarted) {
+      for (const entity of this.remoteEntities.values()) entity.buffer.length = 0;
+    } else if (stamp.shift !== 0) {
+      for (const entity of this.remoteEntities.values()) {
+        for (const sample of entity.buffer) sample.t += stamp.shift;
+      }
+    }
+    return stamp.t;
+  }
+
+  /**
+   * Серверный кадр не двигает чужие машины сразу: он ложится в буфер на
+   * временную шкалу, а рисуем мы всегда чуть в прошлом — между двумя уже
+   * полученными кадрами (updateRemoteEntities). Так пакет с любой задержкой
+   * попадает ровно в своё место, и машина едет непрерывно вместо того, чтобы
+   * прыгать на каждом снапшоте.
+   */
+  private syncRemoteEntities(entities: RemoteEntityState[], t: number): void {
     const next = new Map<string, RemoteEntity>();
     for (const entity of entities) {
-      const bot = this.toRenderBot(entity);
       const known = this.remoteEntities.get(entity.id);
-      const collisionSnap = this.collisionSnapEntities.has(entity.id);
-      if (
-        known &&
-        !collisionSnap &&
-        Math.hypot(entity.x - known.bot.x, entity.y - known.bot.y) <= REMOTE_SNAP
-      ) {
-        bot.x = known.bot.x;
-        bot.y = known.bot.y;
-        bot.angle = known.bot.angle;
-        bot.speed = known.bot.speed;
-      }
-      next.set(entity.id, {
-        bot,
+      const remote: RemoteEntity = known ?? { bot: this.toRenderBot(entity), buffer: [] };
+      if (known) this.refreshRenderBot(known.bot, entity);
+
+      const sample: RemoteSample = {
+        t,
         x: entity.x,
         y: entity.y,
         angle: entity.angle,
         speed: entity.speed,
-        age: 0,
-      });
-      this.collisionSnapEntities.delete(entity.id);
+      };
+      if (pushSample(remote.buffer, sample, REMOTE_SNAP, REMOTE_BUFFER)) {
+        // респавн или новая карта: между «было» и «стало» интерполировать нечего
+        remote.bot.x = entity.x;
+        remote.bot.y = entity.y;
+        remote.bot.angle = entity.angle;
+        remote.bot.speed = entity.speed;
+      }
+      next.set(entity.id, remote);
     }
     this.remoteEntities = next;
     this.bots = [...next.values()].map((entity) => entity.bot);
   }
 
+  /** обновляет всё, кроме положения: его ведёт интерполяция по буферу */
+  private refreshRenderBot(bot: Bot, entity: RemoteEntityState): void {
+    const fresh = this.toRenderBot(entity);
+    fresh.x = bot.x;
+    fresh.y = bot.y;
+    fresh.angle = bot.angle;
+    fresh.speed = bot.speed;
+    Object.assign(bot, fresh);
+  }
+
   /**
-   * Между снапшотами чужие машины продолжают ехать сами по последней скорости,
-   * а отрисовка плавно догоняет цель.
+   * Каждый кадр ставим чужие машины туда, где они были по часам отрисовки —
+   * те идут с небольшим отставанием от сети. Положение считается линейно между
+   * двумя серверными кадрами, угол — по кратчайшей дуге. Данные для этого уже
+   * пришли, поэтому движение выходит непрерывным при любом джиттере.
    */
   private updateRemoteEntities(dt: number): void {
-    const k = 1 - Math.exp(-REMOTE_SMOOTH_RATE * dt);
+    const render = this.timeline.advance(dt, this.netNow());
     for (const entity of this.remoteEntities.values()) {
-      entity.age += dt;
-      if (entity.age < REMOTE_EXTRAPOLATE_S) {
-        entity.x += Math.cos(entity.angle) * entity.speed * dt;
-        entity.y += Math.sin(entity.angle) * entity.speed * dt;
-      }
-      const bot = entity.bot;
-      bot.x += (entity.x - bot.x) * k;
-      bot.y += (entity.y - bot.y) * k;
-      bot.angle += angleDelta(entity.angle, bot.angle) * k;
-      bot.speed += (entity.speed - bot.speed) * k;
+      const at = sampleTimeline(entity.buffer, render);
+      if (!at) continue;
+      entity.bot.x = at.x;
+      entity.bot.y = at.y;
+      entity.bot.angle = at.angle;
+      entity.bot.speed = at.speed;
     }
   }
 
@@ -488,12 +520,11 @@ export class CityRideGame {
       ((event.rammerIsPlayer && event.rammerId === this.onlinePlayerId) ||
         (event.victimIsPlayer && event.victimId === this.onlinePlayerId));
 
-    // Следующий принудительный снимок сервер отправляет сразу после события.
-    // Применяем его без обычного сетевого сглаживания, иначе визуальные кузова
-    // ещё несколько кадров проходят друг сквозь друга после уже случившегося удара.
-    if (event.rammerId !== this.onlinePlayerId) this.collisionSnapEntities.add(event.rammerId);
-    if (event.victimId !== this.onlinePlayerId) this.collisionSnapEntities.add(event.victimId);
-    if (mine) this.collisionSnapPlayer = true;
+    // Чужие машины телепортировать не нужно: принудительный снимок после удара
+    // приедет обычным кадром и ляжет на ту же временную шкалу, что остальные,
+    // так что отскок отрисуется сам — непрерывно. Своей машине лишь ненадолго
+    // ускоряем сходимость с сервером: удар меняет её резче, чем обычная езда.
+    if (mine) this.reconcileBoost = RECONCILE_BOOST_S;
 
     this.crashEffects(event.x, event.y, event.force, mine);
     if (!mine) return;
@@ -786,10 +817,16 @@ export class CityRideGame {
     const wasRefuelling = this.refueling;
 
     this.playerName = player.name;
-    // Отскок после тарана считает сервер. Кладём его в локальное предсказание,
-    // чтобы машину уносило кадр в кадр, а не догоняло рывками через reconcile.
-    this.knock.x = player.kx ?? 0;
-    this.knock.y = player.ky ?? 0;
+    // Отскок после тарана считает сервер, а гасим мы его локально каждый кадр.
+    // Переписывать его целиком на каждом снапшоте нельзя: затухание начиналось
+    // бы заново и машину волокло бы рывками. Берём только новый импульс — то,
+    // что сервер добавил сверх уже отыгранного.
+    const kx = player.kx ?? 0;
+    const ky = player.ky ?? 0;
+    if (Math.hypot(kx, ky) > Math.hypot(this.knock.x, this.knock.y) + 1) {
+      this.knock.x = kx;
+      this.knock.y = ky;
+    }
     this.applyServerPosition(player, mode);
     this.fuel = player.fuel;
     this.fuelMax = player.tankVolume;
@@ -846,30 +883,65 @@ export class CityRideGame {
       this.phase === "play" &&
       player.status === "active" &&
       !!this.online?.connected;
-    const drift = Math.hypot(player.x - c.x, player.y - c.y);
 
-    if (this.collisionSnapPlayer || !predicting || drift > RECONCILE_SNAP) {
+    if (!predicting) {
       c.x = player.x;
       c.y = player.y;
       c.angle = player.angle;
       c.speed = player.speed;
       this.resetServerError();
-      this.collisionSnapPlayer = false;
+      this.reconcileBoost = 0;
       return;
     }
 
-    this.serverError.x = player.x - c.x;
-    this.serverError.y = player.y - c.y;
-    this.serverError.angle = angleDelta(player.angle, c.angle);
-    this.serverError.speed = player.speed - c.speed;
+    // Снапшот показывает машину такой, какой она была примерно RTT назад: наши
+    // команды ещё летели до сервера, ответ летел обратно. Сравнивать его с
+    // текущим предсказанием напрямую нельзя — разница тогда почти вся состоит
+    // из этой задержки, и коррекция постоянно тянет машину назад. Поэтому
+    // сначала продлеваем серверное состояние на задержку вперёд.
+    const lead = clamp(this.online?.latency ?? 0, 0, RECONCILE_MAX_LEAD);
+    const ax = player.x + Math.cos(player.angle) * player.speed * lead;
+    const ay = player.y + Math.sin(player.angle) * player.speed * lead;
+    const drift = Math.hypot(ax - c.x, ay - c.y);
+
+    if (drift > RECONCILE_SNAP) {
+      // предсказание разошлось с сервером слишком сильно — догонять нечем
+      c.x = player.x;
+      c.y = player.y;
+      c.angle = player.angle;
+      c.speed = player.speed;
+      this.resetServerError();
+      this.reconcileBoost = 0;
+      return;
+    }
+
+    const dSpeed = player.speed - c.speed;
+    const dAngle = angleDelta(player.angle, c.angle);
+    if (
+      drift < RECONCILE_DEADZONE &&
+      Math.abs(dSpeed) < RECONCILE_DEADZONE_SPEED &&
+      Math.abs(dAngle) < 0.02
+    ) {
+      // предсказание совпало с сервером: любая правка здесь — это дрожь на
+      // ровном месте, в том числе у камеры, которая целится по скорости
+      this.resetServerError();
+      return;
+    }
+
+    this.serverError.x = ax - c.x;
+    this.serverError.y = ay - c.y;
+    this.serverError.angle = dAngle;
+    this.serverError.speed = dSpeed;
   }
 
   /** гасит накопленное расхождение с сервером понемногу каждый кадр */
   private reconcilePrediction(dt: number): void {
+    if (this.reconcileBoost > 0) this.reconcileBoost = Math.max(0, this.reconcileBoost - dt);
     const e = this.serverError;
     if (!e.x && !e.y && !e.angle && !e.speed) return;
 
-    const k = 1 - Math.exp(-RECONCILE_RATE * dt);
+    const rate = this.reconcileBoost > 0 ? RECONCILE_RATE_HARD : RECONCILE_RATE;
+    const k = 1 - Math.exp(-rate * dt);
     this.car.x += e.x * k;
     this.car.y += e.y * k;
     this.car.angle += e.angle * k;
